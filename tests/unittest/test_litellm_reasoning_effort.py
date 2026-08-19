@@ -932,3 +932,90 @@ class TestLiteLLMReasoningEffortGemini:
 
             call_kwargs = mock_completion.call_args[1]
             assert "reasoning_effort" not in call_kwargs
+
+
+class TestGLMReasoningEffort:
+    """
+    GLM models behind OpenAI-compatible proxies receive their effort through the
+    OpenRouter-style extra_body "reasoning" object instead of the flat
+    reasoning_effort parameter (CLIProxyAPI rejects flat levels above "high").
+    """
+
+    @pytest.mark.asyncio
+    async def test_glm_sends_effort_via_extra_body(self, monkeypatch, mock_logger):
+        """glm-5.3 routes effort through extra_body["reasoning"]["effort"], not the flat param."""
+        fake_settings = create_mock_settings("max")
+        monkeypatch.setattr(litellm_handler, "get_settings", lambda: fake_settings)
+
+        with patch('pr_agent.algo.ai_handlers.litellm_ai_handler.acompletion', new_callable=AsyncMock) as mock_completion:
+            mock_completion.return_value = create_mock_acompletion_response()
+
+            handler = LiteLLMAIHandler()
+            await handler.chat_completion(model="glm-5.3", system="test system", user="test user")
+
+            call_kwargs = mock_completion.call_args[1]
+            assert "reasoning_effort" not in call_kwargs
+            assert call_kwargs["extra_body"]["reasoning"]["effort"] == "max"
+
+    @pytest.mark.asyncio
+    async def test_glm_prefixed_model_uses_extra_body(self, monkeypatch, mock_logger):
+        """Provider-prefixed "openai/glm-5.3" is matched and routed through extra_body."""
+        fake_settings = create_mock_settings("high")
+        monkeypatch.setattr(litellm_handler, "get_settings", lambda: fake_settings)
+
+        with patch('pr_agent.algo.ai_handlers.litellm_ai_handler.acompletion', new_callable=AsyncMock) as mock_completion:
+            mock_completion.return_value = create_mock_acompletion_response()
+
+            handler = LiteLLMAIHandler()
+            await handler.chat_completion(model="openai/glm-5.3", system="test system", user="test user")
+
+            call_kwargs = mock_completion.call_args[1]
+            assert "reasoning_effort" not in call_kwargs
+            assert call_kwargs["extra_body"]["reasoning"]["effort"] == "high"
+
+    @pytest.mark.asyncio
+    async def test_glm_invalid_effort_falls_back_to_medium(self, monkeypatch, mock_logger):
+        """An invalid effort value falls back to medium inside extra_body for GLM."""
+        fake_settings = create_mock_settings("bogus")
+        monkeypatch.setattr(litellm_handler, "get_settings", lambda: fake_settings)
+
+        with patch('pr_agent.algo.ai_handlers.litellm_ai_handler.acompletion', new_callable=AsyncMock) as mock_completion:
+            mock_completion.return_value = create_mock_acompletion_response()
+
+            handler = LiteLLMAIHandler()
+            await handler.chat_completion(model="glm-5.3", system="test system", user="test user")
+
+            call_kwargs = mock_completion.call_args[1]
+            assert call_kwargs["extra_body"]["reasoning"]["effort"] == "medium"
+
+    @pytest.mark.asyncio
+    async def test_non_glm_model_keeps_flat_param(self, monkeypatch, mock_logger):
+        """o3 (non-GLM) keeps the flat reasoning_effort parameter."""
+        fake_settings = create_mock_settings("low")
+        monkeypatch.setattr(litellm_handler, "get_settings", lambda: fake_settings)
+
+        with patch('pr_agent.algo.ai_handlers.litellm_ai_handler.acompletion', new_callable=AsyncMock) as mock_completion:
+            mock_completion.return_value = create_mock_acompletion_response()
+
+            handler = LiteLLMAIHandler()
+            await handler.chat_completion(model="o3", system="test system", user="test user")
+
+            call_kwargs = mock_completion.call_args[1]
+            assert call_kwargs["reasoning_effort"] == "low"
+            assert not (call_kwargs.get("extra_body") or {}).get("reasoning")
+
+    @pytest.mark.asyncio
+    async def test_glm_prefix_boundary_no_overmatch(self, monkeypatch, mock_logger):
+        """A model merely ending in 'glm-5.3' without a slash boundary is not routed to the GLM path."""
+        fake_settings = create_mock_settings("low")
+        monkeypatch.setattr(litellm_handler, "get_settings", lambda: fake_settings)
+
+        with patch('pr_agent.algo.ai_handlers.litellm_ai_handler.acompletion', new_callable=AsyncMock) as mock_completion:
+            mock_completion.return_value = create_mock_acompletion_response()
+
+            handler = LiteLLMAIHandler()
+            await handler.chat_completion(model="my-glm-5.3", system="test system", user="test user")
+
+            call_kwargs = mock_completion.call_args[1]
+            assert "reasoning_effort" not in call_kwargs
+            assert not (call_kwargs.get("extra_body") or {}).get("reasoning")

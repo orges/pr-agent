@@ -675,7 +675,23 @@ class LiteLLMAIHandler(BaseAiHandler):
                             )
 
                     get_logger().info(f"Adding reasoning_effort with value {reasoning_effort} to model {model}.")
-                    kwargs["reasoning_effort"] = reasoning_effort
+                    # GLM models served through OpenAI-compatible proxies accept the OpenRouter-style
+                    # "reasoning" object in the request body, and reject the flat reasoning_effort
+                    # parameter for levels the upstream does not expose (e.g. "max" on CLIProxyAPI).
+                    # Route GLM efforts through extra_body; keep the flat parameter for other models.
+                    model_base = model
+                    while model_base.startswith(('openai/', 'azure/')):
+                        model_base = model_base.removeprefix('openai/').removeprefix('azure/')
+                    if model_base.startswith('glm'):
+                        extra_body = dict(kwargs.get('extra_body') or {})
+                        reasoning_cfg = extra_body.get('reasoning')
+                        if not isinstance(reasoning_cfg, dict):
+                            reasoning_cfg = {}
+                        reasoning_cfg['effort'] = reasoning_effort
+                        extra_body['reasoning'] = reasoning_cfg
+                        kwargs['extra_body'] = extra_body
+                    else:
+                        kwargs["reasoning_effort"] = reasoning_effort
 
                 # https://docs.anthropic.com/en/docs/build-with-claude/extended-thinking
                 if (model in self.claude_extended_thinking_models) and get_settings().config.get("enable_claude_extended_thinking", False):
