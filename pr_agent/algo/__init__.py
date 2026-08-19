@@ -402,6 +402,11 @@ SUPPORT_REASONING_EFFORT_MODELS = [
     # prefixed forms (e.g. "openrouter/google/gemini-2.5-pro") are covered too.
     "gemini-2.5-pro",
     "gemini-2.5-flash",
+    # GLM-5.3 behind an OpenAI-compatible endpoint (e.g. CLIProxyAPI) accepts the
+    # OpenRouter-style "reasoning" body object (low/medium/high/...) but rejects
+    # the flat reasoning_effort parameter for levels above "high"; litellm_ai_handler
+    # routes GLM efforts through extra_body accordingly.
+    "glm-5.3",
 ]
 
 # Claude models that support "extended thinking" through the manual
