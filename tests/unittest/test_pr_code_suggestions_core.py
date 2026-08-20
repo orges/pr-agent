@@ -1,4 +1,4 @@
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -265,13 +265,6 @@ class TestFailureProgressCleanup:
         tool.args = []
         tool._incremental_empty_scope = False
 
-        async def boom():
-            raise RuntimeError("LLM exploded")
-
-        with patch.object(PRCodeSuggestions, "run", boom):
-            pass  # run() is invoked via asyncio in the real flow
-
-        # Drive the real run() path by making prepare_prediction_main raise
         async def failing_prepare(_model):
             raise RuntimeError("LLM exploded")
 
