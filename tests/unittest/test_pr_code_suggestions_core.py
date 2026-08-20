@@ -259,21 +259,22 @@ class TestFailureProgressCleanup:
     async def test_failed_run_edits_progress_comment_in_place(self):
         provider = MagicMock()
         provider.is_supported.return_value = True  # gfm -> progress_response path
+        provider.get_files.return_value = ["a.py"]
         tool = PRCodeSuggestions.__new__(PRCodeSuggestions)
         tool.git_provider = provider
-        tool.progress_response = object()
+        tool.pr_url = "https://github.com/x/y/pull/1"
+        tool.progress_response = None
         tool.args = []
         tool._incremental_empty_scope = False
 
         async def failing_prepare(_model):
             raise RuntimeError("LLM exploded")
 
-        provider.get_files.return_value = ["a.py"]
         tool.prepare_prediction_main = failing_prepare
 
-        get_settings().set("CONFIG.PUBLISH_OUTPUT", True)
-        get_settings().set("CONFIG.PUBLISH_OUTPUT_PROGRESS", True)
-        get_settings().set("CONFIG.IS_AUTO_COMMAND", False)
+        for k, v in [("CONFIG.PUBLISH_OUTPUT", True), ("CONFIG.PUBLISH_OUTPUT_PROGRESS", True),
+                     ("CONFIG.IS_AUTO_COMMAND", False)]:
+            get_settings().set(k, v)
         try:
             await tool.run()
         except RuntimeError:
@@ -290,8 +291,10 @@ class TestFailureProgressCleanup:
     async def test_failed_run_without_progress_posts_failure_note(self):
         provider = MagicMock()
         provider.is_supported.return_value = False  # non-gfm -> remove_initial path
+        provider.get_files.return_value = ["a.py"]
         tool = PRCodeSuggestions.__new__(PRCodeSuggestions)
         tool.git_provider = provider
+        tool.pr_url = "https://github.com/x/y/pull/1"
         tool.progress_response = None
         tool.args = []
         tool._incremental_empty_scope = False
