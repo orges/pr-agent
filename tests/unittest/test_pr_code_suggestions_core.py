@@ -263,6 +263,7 @@ class TestFailureProgressCleanup:
         tool = PRCodeSuggestions.__new__(PRCodeSuggestions)
         tool.git_provider = provider
         tool.pr_url = "https://github.com/x/y/pull/1"
+        tool.progress = "Generating PR code suggestions\nWork in progress ..."
         tool.progress_response = None
         tool.args = []
         tool._incremental_empty_scope = False
