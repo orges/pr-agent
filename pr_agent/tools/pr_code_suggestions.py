@@ -249,14 +249,24 @@ class PRCodeSuggestions:
             get_logger().error(f"Failed to generate code suggestions for PR, error: {e}",
                                artifact={"traceback": traceback.format_exc()})
             if get_settings().config.publish_output:
-                if self.progress_response:
-                    self.git_provider.remove_comment(self.progress_response)
-                else:
-                    try:
+                # Best-effort cleanup so a failed run does not leave the PR stuck on a
+                # "Work in progress ..." comment forever, plus a visible failure note.
+                try:
+                    if self.progress_response:
+                        self.git_provider.edit_comment(
+                            self.progress_response,
+                            body="⚠️ Failed to generate code suggestions. The PR agent encountered an internal error "
+                                 "and gave up; you can retry with `/improve`."
+                        )
+                    else:
                         self.git_provider.remove_initial_comment()
-                        self.git_provider.publish_comment(f"Failed to generate code suggestions for PR")
-                    except Exception as e:
-                        get_logger().exception(f"Failed to update persistent review, error: {e}")
+                        self.git_provider.publish_comment(
+                            "⚠️ Failed to generate code suggestions. The PR agent encountered an internal error "
+                            "and gave up; you can retry with `/improve`."
+                        )
+                except Exception as cleanup_error:
+                    get_logger().exception(
+                        f"Failed to clean up progress comment after code suggestions error: {cleanup_error}")
             if get_settings().config.get("propagate_tool_errors", False):
                 raise
 

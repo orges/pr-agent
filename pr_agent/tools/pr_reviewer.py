@@ -211,6 +211,19 @@ class PRReviewer:
             self.git_provider.remove_initial_comment()
         except Exception as e:
             get_logger().error(f"Failed to review PR: {e}")
+            # Best-effort cleanup so a failed run does not leave the PR stuck on a
+            # temporary "Preparing review..." comment forever. The cleanup itself
+            # must never mask the original error, and a short failure note keeps
+            # the outcome visible to PR watchers.
+            if get_settings().config.publish_output:
+                try:
+                    self.git_provider.remove_initial_comment()
+                    self.git_provider.publish_comment(
+                        "⚠️ Failed to complete the review. The PR agent encountered an internal error and gave up; "
+                        "you can retry with `/review`."
+                    )
+                except Exception as cleanup_error:
+                    get_logger().exception(f"Failed to clean up progress comment after review error: {cleanup_error}")
             if get_settings().config.get("propagate_tool_errors", False):
                 raise
 

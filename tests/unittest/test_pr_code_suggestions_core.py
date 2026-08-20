@@ -250,3 +250,72 @@ def test_persistent_update_survives_progress_cleanup_failure():
     assert provider.edit_comment.call_count == 2
     provider.remove_comment.assert_not_called()
     provider.publish_comment.assert_not_called()
+
+
+class TestFailureProgressCleanup:
+    """A failed /improve run must not leave a stuck progress comment on the PR."""
+
+    @pytest.mark.asyncio
+    async def test_failed_run_edits_progress_comment_in_place(self):
+        provider = MagicMock()
+        provider.is_supported.return_value = True  # gfm -> progress_response path
+        tool = PRCodeSuggestions.__new__(PRCodeSuggestions)
+        tool.git_provider = provider
+        tool.progress_response = object()
+        tool.args = []
+        tool._incremental_empty_scope = False
+
+        async def boom():
+            raise RuntimeError("LLM exploded")
+
+        with patch.object(PRCodeSuggestions, "run", boom):
+            pass  # run() is invoked via asyncio in the real flow
+
+        # Drive the real run() path by making prepare_prediction_main raise
+        async def failing_prepare(_model):
+            raise RuntimeError("LLM exploded")
+
+        provider.get_files.return_value = ["a.py"]
+        tool.prepare_prediction_main = failing_prepare
+
+        get_settings().set("CONFIG.PUBLISH_OUTPUT", True)
+        get_settings().set("CONFIG.PUBLISH_OUTPUT_PROGRESS", True)
+        get_settings().set("CONFIG.IS_AUTO_COMMAND", False)
+        try:
+            await tool.run()
+        except RuntimeError:
+            pytest.fail("run() must swallow the prediction error, not propagate")
+
+        provider.publish_comment.assert_called()          # posted progress
+        provider.edit_comment.assert_called_once()        # replaced with failure note
+        edited_body = provider.edit_comment.call_args.kwargs.get("body", "")
+        assert "Failed to generate code suggestions" in edited_body
+        assert "/improve" in edited_body
+        provider.remove_comment.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_failed_run_without_progress_posts_failure_note(self):
+        provider = MagicMock()
+        provider.is_supported.return_value = False  # non-gfm -> remove_initial path
+        tool = PRCodeSuggestions.__new__(PRCodeSuggestions)
+        tool.git_provider = provider
+        tool.progress_response = None
+        tool.args = []
+        tool._incremental_empty_scope = False
+
+        async def failing_prepare(_model):
+            raise RuntimeError("LLM exploded")
+
+        provider.get_files.return_value = ["a.py"]
+        tool.prepare_prediction_main = failing_prepare
+
+        get_settings().set("CONFIG.PUBLISH_OUTPUT", True)
+        get_settings().set("CONFIG.PUBLISH_OUTPUT_PROGRESS", False)
+        try:
+            await tool.run()
+        except RuntimeError:
+            pytest.fail("run() must swallow the prediction error, not propagate")
+
+        provider.remove_initial_comment.assert_called_once()
+        bodies = [c.args[0] if c.args else "" for c in provider.publish_comment.call_args_list]
+        assert any("Failed to generate code suggestions" in b for b in bodies)
