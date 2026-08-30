@@ -1,32 +1,39 @@
 import difflib
-import hashlib
 import re
 import urllib.parse
 from datetime import datetime, timezone
 from types import SimpleNamespace
-from typing import Any, Optional, Tuple, Union
-from urllib.parse import parse_qs, urlparse
+from typing import Optional, Tuple
+from urllib.parse import urlparse
 
 import gitlab
-import requests
-from gitlab import (GitlabAuthenticationError, GitlabCreateError,
-                    GitlabGetError, GitlabUpdateError)
+from gitlab import GitlabAuthenticationError, GitlabCreateError, GitlabGetError, GitlabUpdateError
 
 from pr_agent.algo.types import EDIT_TYPE, FilePatchInfo
 
 from ..algo.file_filter import filter_ignored
 from ..algo.git_patch_processing import decode_if_bytes
-from ..algo.inline_comment_dedup import (body_fingerprint, body_with_markers,
-                                         code_fingerprint,
-                                         get_inline_comment_store)
+from ..algo.inline_comment_dedup import (
+    body_fingerprint,
+    body_with_markers,
+    code_fingerprint,
+    get_inline_comment_store,
+    is_agent_inline_comment,
+    marker_fingerprints,
+)
 from ..algo.language_handler import is_valid_file
-from ..algo.utils import (clip_tokens, comment_matches_any_identity,
-                          find_line_number_of_relevant_line_in_file,
-                          get_pr_review_comment_identifiers, load_large_diff)
+from ..algo.utils import (
+    PRCodeSuggestionsHeader,
+    PRCodeSuggestionsIdentity,
+    clip_tokens,
+    comment_matches_any_identity,
+    find_line_number_of_relevant_line_in_file,
+    get_pr_review_comment_identifiers,
+    load_large_diff,
+)
 from ..config_loader import get_settings
 from ..log import get_logger
-from .git_provider import (MAX_FILES_ALLOWED_FULL, GitProvider, IncrementalPR,
-                           get_cached_global_settings)
+from .git_provider import MAX_FILES_ALLOWED_FULL, GitProvider, IncrementalPR, get_cached_global_settings
 
 
 class DiffNotFoundError(Exception):
@@ -57,6 +64,35 @@ def _parse_gitlab_iso_datetime(value) -> Optional[datetime]:
         return dt
     except (ValueError, AttributeError):
         return None
+
+
+def _is_outdated_own_inline_thread(discussion, own_user_id: int, current_head_sha: str) -> bool:
+    notes = discussion.attributes.get('notes') or []
+    if not notes or not isinstance(notes[0], dict):
+        return False
+    opener = notes[0]
+    if opener.get('resolved') or opener.get('resolvable') is False:
+        return False
+    position = opener.get('position')
+    if not isinstance(position, dict) or position.get('position_type') != 'text':
+        return False
+    if position.get('new_line') is None and position.get('old_line') is None:
+        return False
+    recorded_head_sha = position.get('head_sha')
+    if not recorded_head_sha or recorded_head_sha == current_head_sha:
+        return False
+    if not is_agent_inline_comment(opener.get('body')):
+        return False
+    for note in notes:
+        if not isinstance(note, dict):
+            return False
+        if note.get('system'):
+            continue
+        author = note.get('author')
+        author_id = author.get('id') if isinstance(author, dict) else None
+        if author_id != own_user_id:
+            return False
+    return True
 
 
 class _GitLabIncrementalCommit:
@@ -361,6 +397,17 @@ class GitLabProvider(GitProvider):
                 })
         return out
 
+    def _get_merge_request_changes(self) -> dict:
+        """Retrieve the complete merge request change set when GitLab reports overflow."""
+        changes = self.mr.changes()
+        if isinstance(changes, dict) and changes.get("overflow"):
+            get_logger().warning(
+                f"GitLab returned an overflowed diff for merge request {self.id_mr}; "
+                "retrying with access_raw_diffs=True"
+            )
+            return self.mr.changes(access_raw_diffs=True)
+        return changes
+
     def is_supported(self, capability: str) -> bool:
         if capability in ['create_inline_comment', 'publish_inline_comments',
             'publish_file_comments']: # gfm_markdown is supported in gitlab !
@@ -431,12 +478,15 @@ class GitLabProvider(GitProvider):
 
     # Match the most recent prior note for each incremental kind against any accepted identity,
     # then use its timestamp as the timeline anchor.
+    _SUGGESTIONS_STABLE_ANCHORS = (
+        PRCodeSuggestionsIdentity.SUMMARY.value,
+        PRCodeSuggestionsIdentity.NO_SUGGESTIONS.value,
+        "**Suggestion:**",  # commitable-suggestions inline mode
+    )
+    _SUGGESTIONS_LEGACY_ANCHORS = (PRCodeSuggestionsHeader.SUMMARY.value,)
     _INCREMENTAL_ANCHOR_PREFIXES = {
         "review": get_pr_review_comment_identifiers(full=True, incremental=True),
-        "suggestions": (
-            "## PR Code Suggestions ✨",           # summary-table mode
-            "**Suggestion:**",                     # commitable-suggestions inline mode
-        ),
+        "suggestions": _SUGGESTIONS_STABLE_ANCHORS + _SUGGESTIONS_LEGACY_ANCHORS,
     }
 
     def get_incremental_commits(self, incremental: Optional[IncrementalPR] = None, kind: str = "review"):
@@ -467,7 +517,11 @@ class GitLabProvider(GitProvider):
 
         kind = getattr(self, '_incremental_kind', 'review')
         prefixes = self._INCREMENTAL_ANCHOR_PREFIXES.get(kind, ())
-        self.previous_review = self._find_anchor_note(prefixes) if prefixes else None
+        self.previous_review = (
+            self._find_anchor_note(prefixes, prefer_latest_activity=kind == "suggestions")
+            if prefixes
+            else None
+        )
         if not self.previous_review:
             get_logger().info(
                 f"No previous {kind} comment found, will fall back to a full run"
@@ -537,7 +591,7 @@ class GitLabProvider(GitProvider):
         try:
             mr_change_paths = {
                 c.get('new_path')
-                for c in self.mr.changes().get('changes', [])
+                for c in self._get_merge_request_changes().get('changes', [])
                 if c.get('new_path')
             }
         except Exception as e:
@@ -597,7 +651,7 @@ class GitLabProvider(GitProvider):
         identifiers = get_pr_review_comment_identifiers(full=full, incremental=incremental)
         return self._find_anchor_note(identifiers)
 
-    def _find_anchor_note(self, identities):
+    def _find_anchor_note(self, identities, *, prefer_latest_activity: bool = False):
         """Return the most recent MR note whose body matches any supplied identity.
 
         Used by incremental flows (`/review -i`, `/improve -i`) to find the timestamp
@@ -605,12 +659,12 @@ class GitLabProvider(GitProvider):
         with `.created_at` parsed to a naive UTC datetime (possibly `None` when the
         GitLab payload had an unexpected shape), or `None` if no match.
 
-        We rely on GitLab returning notes in `created_at DESC` order (the API default)
-        and take the first match — re-sorting locally with a `datetime.min` fallback
-        for unparseable timestamps would silently demote the newest match in favour
-        of an older parseable one, leading to commits being re-reviewed. If the chosen
-        anchor's timestamp doesn't parse, `_get_incremental_commits` falls back to a
-        full run via the existing `last_seen_commit is None` branch.
+        By default, rely on GitLab returning notes in `created_at DESC` order (the API
+        default) and take the first match. Suggestions can instead compare `anchor_time`
+        across every matching stable or legacy identity so an older persistent note that
+        was edited more recently wins. If the newest-created match has an unparseable
+        timestamp, retain it so `_get_incremental_commits` safely falls back to a full run
+        instead of silently demoting it in favour of an older parseable note.
 
         Notes authored by other users are skipped when the authenticated (bot) user is
         known: a human comment that merely starts with `**Suggestion:**` must not shift
@@ -629,6 +683,7 @@ class GitLabProvider(GitProvider):
                 return None
         mr_web_url = getattr(self.mr, 'web_url', None)
         own_user_id = self._get_own_user_id()
+        selected_note = None
         for note in self._incremental_notes_cache:
             body = getattr(note, 'body', None)
             if not isinstance(body, str):
@@ -644,8 +699,16 @@ class GitLabProvider(GitProvider):
                         f"user (author {author_id}, bot {own_user_id})"
                     )
                     continue
-            return _GitLabIncrementalNote(note, mr_web_url=mr_web_url)
-        return None
+            candidate = _GitLabIncrementalNote(note, mr_web_url=mr_web_url)
+            if not prefer_latest_activity:
+                return candidate
+            if selected_note is None:
+                selected_note = candidate
+                if selected_note.anchor_time is None:
+                    return selected_note
+            elif candidate.anchor_time is not None and candidate.anchor_time > selected_note.anchor_time:
+                selected_note = candidate
+        return selected_note
 
     def _get_own_user_id(self) -> Optional[int]:
         """ID of the authenticated user (the one posting pr-agent notes), or None when
@@ -657,7 +720,7 @@ class GitLabProvider(GitProvider):
             except Exception as e:
                 get_logger().warning(
                     f"Could not resolve the authenticated GitLab user; "
-                    f"incremental anchor notes will not be filtered by author: {e}"
+                    f"author-based filtering is disabled for this run: {e}"
                 )
                 self._own_user_id = None
         return self._own_user_id
@@ -738,7 +801,7 @@ class GitLabProvider(GitProvider):
             if not head_sha_for_content:
                 head_sha_for_content = (self.mr.diff_refs or {}).get('head_sha')
         else:
-            raw_changes = self.mr.changes().get('changes', [])
+            raw_changes = self._get_merge_request_changes().get('changes', [])
             raw_changes = self._expand_submodule_changes(raw_changes)
             base_sha_for_content = self.mr.diff_refs['base_sha']
             head_sha_for_content = self.mr.diff_refs['head_sha']
@@ -770,7 +833,7 @@ class GitLabProvider(GitProvider):
                 new_file_content_str = self.get_pr_file_content(diff['new_path'], head_sha_for_content)
             else:
                 if counter_valid == MAX_FILES_ALLOWED_FULL:
-                    get_logger().info(f"Too many files in PR, will avoid loading full content for rest of files")
+                    get_logger().info("Too many files in PR, will avoid loading full content for rest of files")
                 original_file_content_str = ''
                 new_file_content_str = ''
 
@@ -816,7 +879,7 @@ class GitLabProvider(GitProvider):
                 and getattr(self, 'unreviewed_files_map', None)):
             return list(self.unreviewed_files_map.keys())
         if not self.git_files:
-            raw_changes = self.mr.changes().get('changes', [])
+            raw_changes = self._get_merge_request_changes().get('changes', [])
             raw_changes = self._expand_submodule_changes(raw_changes)
             self.git_files = [c.get('new_path') for c in raw_changes if c.get('new_path')]
         return self.git_files
@@ -913,6 +976,46 @@ class GitLabProvider(GitProvider):
                 return
         except Exception as e:
             get_logger().warning(f"Failed to reopen resolved review thread: {e}")
+
+    def resolve_outdated_inline_threads(self):
+        if not get_settings().get("GITLAB.RESOLVE_OUTDATED_INLINE_THREADS", False):
+            return
+        own_user_id = self._get_own_user_id()
+        try:
+            current_head_sha = self.mr.diff_refs['head_sha']
+        except (KeyError, TypeError, AttributeError):
+            current_head_sha = None
+        if own_user_id is None or not current_head_sha:
+            get_logger().warning(
+                f"Skipping outdated inline thread cleanup on merge request {self.id_mr} "
+                f"(bot user: {own_user_id}, current head sha: {current_head_sha})"
+            )
+            return
+        try:
+            discussions = self.mr.discussions.list(get_all=True)
+        except Exception as e:
+            get_logger().warning(f"Failed to list discussions of merge request {self.id_mr}: {e}")
+            return
+        resolved = 0
+        released_fps = set()
+        for discussion in discussions:
+            discussion_id = getattr(discussion, 'id', None)
+            try:
+                if not _is_outdated_own_inline_thread(discussion, own_user_id, current_head_sha):
+                    continue
+                discussion.resolved = True
+                discussion.save()
+                resolved += 1
+                for note in discussion.attributes.get('notes') or []:
+                    if isinstance(note, dict):
+                        released_fps |= marker_fingerprints(note.get('body'))
+            except Exception as e:
+                get_logger().warning(f"Failed to resolve outdated inline thread {discussion_id}: {e}")
+        if released_fps:
+            get_inline_comment_store(self).release(released_fps)
+        if resolved:
+            get_logger().info(
+                f"Resolved {resolved} outdated inline thread(s) on merge request {self.id_mr}")
 
     def edit_comment_from_comment_id(self, comment_id: int, body: str):
         body = self.limit_output_characters(body, self.max_comment_chars)
@@ -1043,7 +1146,7 @@ class GitLabProvider(GitProvider):
                 link = self.get_line_link(relevant_file, line_start, line_end)
                 body_fallback =f"**Suggestion:** {content} [{label}, importance: {score}]\n\n"
                 body_fallback +=f"\n\n<details><summary>[{target_file.filename} [{line_start}-{line_end}]]({link}):</summary>\n\n"
-                body_fallback += f"\n\n___\n\n`(Cannot implement directly - GitLab API allows committable suggestions strictly on MR diff lines)`"
+                body_fallback += "\n\n___\n\n`(Cannot implement directly - GitLab API allows committable suggestions strictly on MR diff lines)`"
                 body_fallback+="</details>\n\n"
                 diff_patch = difflib.unified_diff(old_code_snippet.split('\n'),
                                             new_code_snippet.split('\n'), n=999)
@@ -1078,7 +1181,7 @@ class GitLabProvider(GitProvider):
                 return False
 
     def get_relevant_diff(self, relevant_file: str, relevant_line_in_file: str) -> Optional[dict]:
-        _changes = self.mr.changes()  # dict
+        _changes = self._get_merge_request_changes()
         _changes['changes'] = self._expand_submodule_changes(_changes.get('changes', []))
         changes = _changes
         if not changes:
@@ -1096,6 +1199,8 @@ class GitLabProvider(GitProvider):
         return self.last_diff  # fallback to the latest diff if no relevant diff is found
 
     def publish_code_suggestions(self, code_suggestions: list) -> bool:
+        # Runs first so the fingerprints it frees are in the store before any dedup lookup.
+        self.resolve_outdated_inline_threads()
         # When true, suggestions are queued as GitLab draft notes and published together in a single
         # batch at the end, instead of each one going out as its own live discussion (and its own
         # notification/email) as soon as it's created.

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import ast
 import copy
 import difflib
 import hashlib
@@ -8,11 +7,13 @@ import html
 import json
 import os
 import re
+import string
 import sys
 import textwrap
 import time
 import traceback
 from datetime import datetime
+from decimal import ROUND_HALF_UP, Decimal
 from enum import Enum
 from importlib.metadata import PackageNotFoundError, version
 from typing import Any, Iterable, List, Tuple, TypedDict
@@ -24,8 +25,7 @@ from pydantic import BaseModel
 from starlette_context import context
 
 from pr_agent.algo import MAX_TOKENS
-from pr_agent.algo.git_patch_processing import (extract_hunk_headers,
-                                                extract_hunk_lines_from_patch)
+from pr_agent.algo.git_patch_processing import extract_hunk_headers, extract_hunk_lines_from_patch
 from pr_agent.algo.run_details import get_run_details
 from pr_agent.algo.token_handler import TokenEncoder
 from pr_agent.algo.types import FilePatchInfo
@@ -70,25 +70,64 @@ class PRReviewIdentity(str, Enum):
     INCREMENTAL = "<!-- pr-agent:review:incremental -->"
 
 
+class PRCodeSuggestionsHeader(str, Enum):
+    SUMMARY = "## PR Code Suggestions ✨"
+
+
+class PRCodeSuggestionsIdentity(str, Enum):
+    SUMMARY = "<!-- pr-agent:improve:summary -->"
+    NO_SUGGESTIONS = "<!-- pr-agent:improve:no-suggestions -->"
+
+
 _REVIEW_IDENTITY_HEADER_LINES = 5
+_MARKDOWN_PUNCTUATION_ESCAPE_TABLE = str.maketrans(
+    {character: f"\\{character}" for character in string.punctuation}
+)
+
+
+def _get_configured_heading(setting_name: str, default_heading: str) -> str:
+    configured_heading = get_settings().get(setting_name)
+    if (
+        not isinstance(configured_heading, str)
+        or not configured_heading.strip()
+        or configured_heading.splitlines() != [configured_heading]
+    ):
+        get_logger().warning(
+            f"Invalid {setting_name}; using the default heading"
+        )
+        configured_heading = default_heading
+    return configured_heading.strip()
 
 
 def format_pr_review_header(incremental: bool = False) -> str:
     """Return the visible review heading while keeping identity out of presentation."""
-    configured_heading = get_settings().get("pr_reviewer.review_heading")
-    if (
-        not isinstance(configured_heading, str)
-        or not configured_heading.strip()
-        or "\n" in configured_heading
-        or "\r" in configured_heading
-    ):
-        get_logger().warning(
-            "Invalid pr_reviewer.review_heading; using the default review heading"
-        )
-        configured_heading = PRReviewHeader.REGULAR.value.removeprefix("## ")
-    heading = configured_heading.strip()
+    default_heading = PRReviewHeader.REGULAR.value.removeprefix("## ")
+    heading = _get_configured_heading("pr_reviewer.review_heading", default_heading)
     incremental_prefix = "Incremental " if incremental else ""
     return f"## {incremental_prefix}{heading} 🔍"
+
+
+def format_pr_code_suggestions_header(markdown_level: int = 2) -> str:
+    """Return the visible suggestions heading while keeping identity out of presentation."""
+    default_heading = (
+        PRCodeSuggestionsHeader.SUMMARY.value
+        .removeprefix("## ")
+        .removesuffix(" ✨")
+    )
+    heading = _get_configured_heading(
+        "pr_code_suggestions.suggestions_heading",
+        default_heading,
+    )
+    markdown_prefix = "#" * markdown_level
+    return f"{markdown_prefix} {heading} ✨"
+
+
+def format_pr_questions_header(*, escape_markdown: bool = True) -> str:
+    """Return the visible heading for top-level /ask answers."""
+    heading = _get_configured_heading("pr_questions.ask_heading", "Ask")
+    if escape_markdown:
+        heading = heading.translate(_MARKDOWN_PUNCTUATION_ESCAPE_TABLE)
+    return f"### **{heading}** ❓"
 
 
 def comment_matches_identity(body: str, identity: str) -> bool:
@@ -117,7 +156,7 @@ def get_pr_review_comment_identifiers(*, full: bool, incremental: bool) -> tuple
     return tuple(identifiers)
 
 
-def add_pr_review_identity(pr_comment: str, identity_marker: str | None) -> str:
+def add_comment_identity(pr_comment: str, identity_marker: str | None) -> str:
     """Insert a hidden identity after the visible heading without changing rendered output."""
     if not pr_comment or not identity_marker or comment_matches_identity(pr_comment, identity_marker):
         return pr_comment
@@ -125,6 +164,10 @@ def add_pr_review_identity(pr_comment: str, identity_marker: str | None) -> str:
     if not separator:
         return f"{pr_comment.rstrip()}\n\n{identity_marker}"
     return f"{heading}\n\n{identity_marker}\n\n{remainder}"
+
+
+def add_pr_review_identity(pr_comment: str, identity_marker: str | None) -> str:
+    return add_comment_identity(pr_comment, identity_marker)
 
 
 class ReasoningEffort(str, Enum):
@@ -237,7 +280,7 @@ def convert_to_markdown_v2(output_data: dict,
         return ""
 
     if get_settings().get("pr_reviewer.enable_intro_text", False):
-        markdown_text += f"Here are some key observations to aid the review process:\n\n"
+        markdown_text += "Here are some key observations to aid the review process:\n\n"
 
     if gfm_supported:
         markdown_text += "<table>\n"
@@ -264,20 +307,20 @@ def convert_to_markdown_v2(output_data: dict,
             white_bars = '⚪' * (5 - value_int)
             value = f"{value_int} {blue_bars}{white_bars}"
             if gfm_supported:
-                markdown_text += f"<tr><td>"
+                markdown_text += "<tr><td>"
                 markdown_text += f"{emoji}&nbsp;<strong>{key_nice}</strong>: {value}"
-                markdown_text += f"</td></tr>\n"
+                markdown_text += "</td></tr>\n"
             else:
                 markdown_text += f"### {emoji} {key_nice}: {value}\n\n"
         elif 'relevant tests' in key_nice.lower():
             value = str(value).strip().lower()
             if gfm_supported:
-                markdown_text += f"<tr><td>"
+                markdown_text += "<tr><td>"
                 if is_value_no(value):
                     markdown_text += f"{emoji}&nbsp;<strong>No relevant tests</strong>"
                 else:
                     markdown_text += f"{emoji}&nbsp;<strong>PR contains tests</strong>"
-                markdown_text += f"</td></tr>\n"
+                markdown_text += "</td></tr>\n"
             else:
                 if is_value_no(value):
                     markdown_text += f'### {emoji} No relevant tests\n\n'
@@ -298,7 +341,7 @@ def convert_to_markdown_v2(output_data: dict,
                 avg = _expand_minute_suffix(value['average_case'])
                 worst = _expand_minute_suffix(value['worst_case'])
                 markdown_text += f"{best} | {avg} | {worst}"
-                markdown_text += f"</td></tr>\n"
+                markdown_text += "</td></tr>\n"
             else:
                 markdown_text += f"### {emoji} Contribution time estimate (best, average, worst case): "
                 best = _expand_minute_suffix(value['best_case'])
@@ -307,14 +350,14 @@ def convert_to_markdown_v2(output_data: dict,
                 markdown_text += f"{best} | {avg} | {worst}\n\n"
         elif 'security concerns' in key_nice.lower():
             if gfm_supported:
-                markdown_text += f"<tr><td>"
+                markdown_text += "<tr><td>"
                 if is_value_no(value):
                     markdown_text += f"{emoji}&nbsp;<strong>No security concerns identified</strong>"
                 else:
                     markdown_text += f"{emoji}&nbsp;<strong>Security concerns</strong><br><br>\n\n"
                     value = emphasize_header(value.strip())
                     markdown_text += f"{value}"
-                markdown_text += f"</td></tr>\n"
+                markdown_text += "</td></tr>\n"
             else:
                 if is_value_no(value):
                     markdown_text += f'### {emoji} No security concerns identified\n\n'
@@ -326,7 +369,7 @@ def convert_to_markdown_v2(output_data: dict,
             if gfm_supported:
                 markdown_text += "<tr><td>"
                 if is_value_no(value):
-                    markdown_text += f"✅&nbsp;<strong>No TODO sections</strong>"
+                    markdown_text += "✅&nbsp;<strong>No TODO sections</strong>"
                 else:
                     markdown_todo_items = format_todo_items(value, git_provider, gfm_supported)
                     markdown_text += f"{emoji}&nbsp;<strong>TODO sections</strong>\n<br><br>\n"
@@ -334,29 +377,29 @@ def convert_to_markdown_v2(output_data: dict,
                 markdown_text += "</td></tr>\n"
             else:
                 if is_value_no(value):
-                    markdown_text += f"### ✅ No TODO sections\n\n"
+                    markdown_text += "### ✅ No TODO sections\n\n"
                 else:
                     markdown_todo_items = format_todo_items(value, git_provider, gfm_supported)
                     markdown_text += f"### {emoji} TODO sections\n\n"
                     markdown_text += markdown_todo_items
         elif 'can be split' in key_nice.lower():
             if gfm_supported:
-                markdown_text += f"<tr><td>"
+                markdown_text += "<tr><td>"
                 markdown_text += process_can_be_split(emoji, value)
-                markdown_text += f"</td></tr>\n"
+                markdown_text += "</td></tr>\n"
         elif 'key issues to review' in key_nice.lower():
             # value is a list of issues
             if is_value_no(value):
                 if gfm_supported:
-                    markdown_text += f"<tr><td>"
+                    markdown_text += "<tr><td>"
                     markdown_text += f"{emoji}&nbsp;<strong>No major issues detected</strong>"
-                    markdown_text += f"</td></tr>\n"
+                    markdown_text += "</td></tr>\n"
                 else:
                     markdown_text += f"### {emoji} No major issues detected\n\n"
             else:
                 issues = value
                 if gfm_supported:
-                    markdown_text += f"<tr><td>"
+                    markdown_text += "<tr><td>"
                     # markdown_text += f"{emoji}&nbsp;<strong>{key_nice}</strong><br><br>\n\n"
                     markdown_text += f"{emoji}&nbsp;<strong>Recommended focus areas for review</strong><br><br>\n\n"
                 else:
@@ -396,12 +439,12 @@ def convert_to_markdown_v2(output_data: dict,
                     except Exception as e:
                         get_logger().exception(f"Failed to process 'Recommended focus areas for review': {e}")
                 if gfm_supported:
-                    markdown_text += f"</td></tr>\n"
+                    markdown_text += "</td></tr>\n"
         else:
             if gfm_supported:
-                markdown_text += f"<tr><td>"
+                markdown_text += "<tr><td>"
                 markdown_text += f"{emoji}&nbsp;<strong>{key_nice}</strong>: {value}"
-                markdown_text += f"</td></tr>\n"
+                markdown_text += "</td></tr>\n"
             else:
                 markdown_text += f"### {emoji} {key_nice}: {value}\n\n"
 
@@ -471,7 +514,7 @@ def ticket_markdown_logic(emoji, markdown_text, value, gfm_supported) -> str:
                                                                           '').strip()
 
                 if not fully_compliant_str and not not_compliant_str and not requires_further_human_verification:
-                    get_logger().debug(f"Ticket compliance has no requirements",
+                    get_logger().debug("Ticket compliance has no requirements",
                                        artifact={'ticket_url': ticket_url})
                     continue
 
@@ -504,7 +547,7 @@ def ticket_markdown_logic(emoji, markdown_text, value, gfm_supported) -> str:
 
                 # for debugging
                 if requires_further_human_verification:
-                    get_logger().debug(f"Ticket compliance requires further human verification",
+                    get_logger().debug("Ticket compliance requires further human verification",
                                        artifact={'ticket_url': ticket_url,
                                                  'requires_further_human_verification': requires_further_human_verification,
                                                  'compliance_level': ticket_compliance_level})
@@ -541,10 +584,10 @@ def ticket_markdown_logic(emoji, markdown_text, value, gfm_supported) -> str:
 
         # editing table row for ticket compliance analysis
         if gfm_supported:
-            markdown_text += f"<tr><td>\n\n"
+            markdown_text += "<tr><td>\n\n"
             markdown_text += f"**{emoji} Ticket compliance analysis {compliance_emoji}**\n\n"
             markdown_text += ticket_compliance_str
-            markdown_text += f"</td></tr>\n"
+            markdown_text += "</td></tr>\n"
         else:
             markdown_text += f"### {emoji} Ticket compliance analysis {compliance_emoji}\n\n"
             markdown_text += ticket_compliance_str + "\n\n"
@@ -568,11 +611,11 @@ def process_can_be_split(emoji, value):
                 title = split.get('title', '')
                 relevant_files = split.get('relevant_files', [])
                 markdown_text += f"<details><summary>\nSub-PR theme: <b>{title}</b></summary>\n\n"
-                markdown_text += f"___\n\nRelevant files:\n\n"
+                markdown_text += "___\n\nRelevant files:\n\n"
                 for file in relevant_files:
                     markdown_text += f"- {file}\n"
-                markdown_text += f"___\n\n"
-                markdown_text += f"</details>\n\n"
+                markdown_text += "___\n\n"
+                markdown_text += "</details>\n\n"
 
                 # markdown_text += f"#### Sub-PR theme: {title}\n\n"
                 # markdown_text += f"Relevant files:\n\n"
@@ -629,7 +672,7 @@ def parse_code_suggestion(code_suggestion: dict, i: int = 0, gfm_supported: bool
                     markdown_text += (f"<tr><td>{sub_key} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;</td>"
                                       f"<td>\n\n<strong>\n\n{sub_value.strip()}\n\n</strong>\n</td></tr>")
                 elif sub_key.lower() == 'relevant_line':
-                    markdown_text += f"<tr><td>relevant line</td>"
+                    markdown_text += "<tr><td>relevant line</td>"
                     sub_value_list = sub_value.split('](')
                     relevant_line = sub_value_list[0].lstrip('`').lstrip('[')
                     if len(sub_value_list) > 1:
@@ -872,7 +915,7 @@ def load_yaml(response_text: str, keys_fix_yaml: List[str] = [], first_key="", l
     response_text = response_text.strip('\n')
     # strip the fence label only when it is a complete info string, so a key such as
     # "yml_config" is not truncated to "_config"
-    unfenced = re.sub(r'^```[ \t]*(?:yaml|yml)?[ \t]*(?=\r?\n)', '', response_text)
+    unfenced = re.sub(r'^```[ \t]*(?:(?i:yaml|yml))?[ \t]*(?=\r?\n)', '', response_text)
     if unfenced == response_text:
         unfenced = response_text.removeprefix('yaml')
     response_text = unfenced.rstrip().removesuffix('```')
@@ -892,10 +935,10 @@ def load_yaml(response_text: str, keys_fix_yaml: List[str] = [], first_key="", l
         data = try_fix_yaml(response_text, keys_fix_yaml=keys_fix_yaml, first_key=first_key, last_key=last_key,
                             response_text_original=response_text_original_sanitized)
         if not data:
-            get_logger().error(f"Failed to parse AI prediction after fallbacks",
+            get_logger().error("Failed to parse AI prediction after fallbacks",
                                artifact={'response_text': response_text})
         else:
-            get_logger().info(f"Successfully parsed AI prediction after fallbacks",
+            get_logger().info("Successfully parsed AI prediction after fallbacks",
                               artifact={'response_text': response_text})
     return data
 
@@ -922,7 +965,7 @@ def try_fix_yaml(response_text: str,
     try:
         data = yaml.safe_load('\n'.join(response_text_lines_copy))
         if data is not None:
-            get_logger().info(f"Successfully parsed AI prediction after adding |-\n")
+            get_logger().info("Successfully parsed AI prediction after adding |-\n")
             return data
     except:
         pass
@@ -933,7 +976,7 @@ def try_fix_yaml(response_text: str,
     try:
         data = yaml.safe_load(response_text_copy)
         if data is not None:
-            get_logger().info(f"Successfully parsed AI prediction after replacing | with |2")
+            get_logger().info("Successfully parsed AI prediction after replacing | with |2")
             return data
     except:
         pass
@@ -947,13 +990,13 @@ def try_fix_yaml(response_text: str,
     try:
         data = yaml.safe_load('\n'.join(response_text_lines_copy))
         if data is not None:
-            get_logger().info(f"Successfully parsed AI prediction after replacing | with |2 and adding spaces")
+            get_logger().info("Successfully parsed AI prediction after replacing | with |2 and adding spaces")
             return data
     except:
         pass
 
     # second fallback - try to extract only range from first ```yaml to the last ```
-    snippet_pattern = r'```[ \t]*(?:(?:yaml|yml)[ \t]*)?\r?\n([\s\S]*?)```(?=\s*$|")'
+    snippet_pattern = r'```[ \t]*(?:(?i:yaml|yml)[ \t]*)?\r?\n([\s\S]*?)```(?=\s*$|")'
     snippet = re.search(snippet_pattern, '\n'.join(response_text_lines_copy))
     if not snippet:
         snippet = re.search(snippet_pattern, response_text_original) # before we removed the "```"
@@ -963,7 +1006,7 @@ def try_fix_yaml(response_text: str,
         try:
             data = yaml.safe_load(snippet_text)
             if data is not None:
-                get_logger().info(f"Successfully parsed AI prediction after extracting yaml snippet")
+                get_logger().info("Successfully parsed AI prediction after extracting yaml snippet")
                 return data
         except Exception as e:
             get_logger().debug(f"Failed to parse AI prediction after extracting yaml snippet: {e}")
@@ -974,7 +1017,7 @@ def try_fix_yaml(response_text: str,
     try:
         data = yaml.safe_load(response_text_copy)
         if data is not None:
-            get_logger().info(f"Successfully parsed AI prediction after removing curly brackets")
+            get_logger().info("Successfully parsed AI prediction after removing curly brackets")
             return data
     except:
         pass
@@ -991,12 +1034,17 @@ def try_fix_yaml(response_text: str,
         index_end = response_text.find("\n\n", index_last_code) # look for newlines after last_key
         if index_end == -1:
             index_end = len(response_text)
-        response_text_copy = response_text[index_start:index_end].strip().strip('```yaml').strip('`').strip()
+        response_text_copy = response_text[index_start:index_end].strip()
+        for fence in ("\n```yaml", "\n```yml"):
+            if response_text_copy[-len(fence):].lower() == fence:
+                response_text_copy = response_text_copy[: -len(fence)]
+                break
+        response_text_copy = response_text_copy.strip("`").strip()
         if response_text_copy:
             try:
                 data = yaml.safe_load(response_text_copy)
                 if data is not None:
-                    get_logger().info(f"Successfully parsed AI prediction after extracting yaml snippet")
+                    get_logger().info("Successfully parsed AI prediction after extracting yaml snippet")
                     return data
             except:
                 pass
@@ -1009,10 +1057,49 @@ def try_fix_yaml(response_text: str,
     try:
         data = yaml.safe_load('\n'.join(response_text_lines_copy))
         if data is not None:
-            get_logger().info(f"Successfully parsed AI prediction after removing leading '+'")
+            get_logger().info("Successfully parsed AI prediction after removing leading '+'")
             return data
     except:
         pass
+
+    # 5.5 fallback - try to normalize diff-style removal markers ('-') within list items
+    response_text_lines_copy = response_text_lines.copy()
+    modified = False
+
+    for i, line in enumerate(response_text_lines_copy):
+        if line.startswith('+'):
+            response_text_lines_copy[i] = ' ' + line[1:]
+            modified = True
+
+    # normalize lines starting with '-'. Distinguish real YAML list items from diff deletions.
+    for i, line in enumerate(response_text_lines_copy):
+        if not line.startswith('-'):
+            continue
+
+        remainder = line[1:]
+        if line.startswith('- '):
+            second_char = remainder[1] if len(remainder) > 1 else ''
+            if second_char and second_char not in (' ', '\t', '+', '-'):
+                continue # real list item → keep as-is
+
+        # treat it as a diff "removed" marker inside block content
+        cleaned = remainder
+        while cleaned and cleaned[0] in ('+', '-'):
+            cleaned = cleaned[1:]
+        if cleaned and cleaned[0] not in (' ', '\t'):
+            cleaned = ' ' + cleaned
+        if cleaned != line:
+            response_text_lines_copy[i] = cleaned
+            modified = True
+    if modified:
+        try:
+            data = yaml.safe_load('\n'.join(response_text_lines_copy))
+            if data is not None:
+                get_logger().info("Successfully parsed AI prediction after normalizing diff removal markers")
+                return data
+        except Exception:
+            pass
+
 
     # sixth fallback - replace tabs with spaces
     if '\t' in response_text:
@@ -1021,7 +1108,7 @@ def try_fix_yaml(response_text: str,
         try:
             data = yaml.safe_load(response_text_copy)
             if data is not None:
-                get_logger().info(f"Successfully parsed AI prediction after replacing tabs with spaces")
+                get_logger().info("Successfully parsed AI prediction after replacing tabs with spaces")
                 return data
         except:
             pass
@@ -1045,7 +1132,7 @@ def try_fix_yaml(response_text: str,
     try:
         data = yaml.safe_load(response_text_copy)
         if data is not None:
-            get_logger().info(f"Successfully parsed AI prediction after adding indent for sections of code blocks")
+            get_logger().info("Successfully parsed AI prediction after adding indent for sections of code blocks")
             return data
     except:
         pass
@@ -1056,7 +1143,7 @@ def try_fix_yaml(response_text: str,
     try:
         data = yaml.safe_load(response_text_copy)
         if data is not None:
-            get_logger().info(f"Successfully parsed AI prediction after removing pipe chars")
+            get_logger().info("Successfully parsed AI prediction after removing pipe chars")
             return data
     except:
         pass
@@ -1470,7 +1557,7 @@ def show_relevant_configurations(relevant_section: str) -> str:
     markdown_text = ""
     markdown_text += "\n<hr>\n<details> <summary><strong>🛠️ Relevant configurations:</strong></summary> \n\n"
     markdown_text +="<br>These are the relevant [configurations](https://github.com/Codium-ai/pr-agent/blob/main/pr_agent/settings/configuration.toml) for this tool:\n\n"
-    markdown_text += f"**[config**]\n```yaml\n\n"
+    markdown_text += "**[config**]\n```yaml\n\n"
     for key, value in get_settings().config.items():
         if key.lower() in skip_keys_lower:
             continue
@@ -1484,6 +1571,14 @@ def show_relevant_configurations(relevant_section: str) -> str:
     markdown_text += "\n```"
     markdown_text += "\n</details>\n"
     return markdown_text
+
+
+def _format_usd(cost: Decimal) -> str:
+    """Format cost at two decimals without turning a positive amount into false zero."""
+    rounded = cost.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    if cost > 0 and rounded == 0:
+        return "<$0.01"
+    return f"${rounded:.2f}"
 
 
 def show_run_details(gfm_supported: bool) -> str:
@@ -1508,6 +1603,21 @@ def show_run_details(gfm_supported: bool) -> str:
     lines.append(f"- Time cost: {details.duration_seconds:.1f}s")
     if details.num_ai_calls:
         lines.append(f"- AI calls: {details.num_ai_calls}")
+    if get_settings().get("config.output_run_cost", False) and details.num_ai_calls:
+        if details.cost_status == "unavailable":
+            # No causal claim here: pricing can be missing because usage was absent
+            # (streaming without a final usage chunk) or because the active handler
+            # never collects costs (openai/langchain handlers).
+            lines.append("- Estimated API cost: unavailable (no calls could be priced)")
+        else:
+            partial = ""
+            if details.cost_status == "partial":
+                partial = (f" (partial: {details.known_cost_call_count} of "
+                           f"{details.num_ai_calls} successful calls priced)")
+            lines.append(f"- Estimated API cost: {_format_usd(details.total_cost_usd)} USD{partial}")
+            if len(details.model_costs_usd) > 1:
+                for model, cost in details.model_costs_usd.items():
+                    lines.append(f"  - {model}: {_format_usd(cost)} USD")
     body = "\n".join(lines)
 
     if gfm_supported:
@@ -1631,7 +1741,7 @@ def process_description(description_full: str) -> Tuple[str, List]:
                         if '<code>...</code>' in file_data:
                             pass # PR with many files. some did not get analyzed
                         else:
-                            get_logger().warning(f"Failed to parse description", artifact={'description': file_data})
+                            get_logger().warning("Failed to parse description", artifact={'description': file_data})
                 except Exception as e:
                     get_logger().exception(f"Failed to process description: {e}", artifact={'description': file_data})
 
