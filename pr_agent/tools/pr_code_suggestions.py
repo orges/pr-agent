@@ -21,6 +21,7 @@ from pr_agent.algo.pr_processing import (
     get_pr_multi_diffs,
     retry_with_fallback_models,
 )
+from pr_agent.algo.prompt_fragments import render_diff_hunk_format
 from pr_agent.algo.repo_context import build_repo_context
 from pr_agent.algo.run_details import init_run_details
 from pr_agent.algo.skills_loader import get_skills_context
@@ -108,6 +109,7 @@ class PRCodeSuggestions:
             get_settings().set("config.enable_ai_metadata", False)
             get_logger().debug("AI metadata is disabled for this command")
 
+        is_ai_metadata = get_settings().get("config.enable_ai_metadata", False)
         self.vars = {
             "title": self.git_provider.pr.title,
             "branch": self.git_provider.get_pr_branch(),
@@ -122,7 +124,11 @@ class PRCodeSuggestions:
             "suggestion_discussion_context": self._load_suggestion_discussion_context(),
             "commit_messages_str": self.git_provider.get_commit_messages(),
             "relevant_best_practices": "",
-            "is_ai_metadata": get_settings().get("config.enable_ai_metadata", False),
+            "is_ai_metadata": is_ai_metadata,
+            "diff_hunk_format": render_diff_hunk_format(
+                include_line_numbers=False,
+                include_ai_metadata=is_ai_metadata,
+            ),
             "focus_only_on_problems": get_settings().get("pr_code_suggestions.focus_only_on_problems", False),
             "date": datetime.now().strftime('%Y-%m-%d'),
             'duplicate_prompt_examples': get_settings().config.get('duplicate_prompt_examples', False),
@@ -805,6 +811,7 @@ class PRCodeSuggestions:
 
     @staticmethod
     def _truncate_if_needed(suggestion):
+        suggestion.pop('_is_truncated', None)
         max_code_suggestion_length = get_settings().get("PR_CODE_SUGGESTIONS.MAX_CODE_SUGGESTION_LENGTH", 0)
         suggestion_truncation_message = get_settings().get("PR_CODE_SUGGESTIONS.SUGGESTION_TRUNCATION_MESSAGE", "")
         if max_code_suggestion_length > 0:
@@ -813,6 +820,7 @@ class PRCodeSuggestions:
                                   f"characters to {max_code_suggestion_length} characters")
                 suggestion['improved_code'] = suggestion['improved_code'][:max_code_suggestion_length]
                 suggestion['improved_code'] += f"\n{suggestion_truncation_message}"
+                suggestion['_is_truncated'] = True
         return suggestion
 
     def _prepare_pr_code_suggestions(self, predictions: str) -> Dict:
@@ -913,6 +921,23 @@ class PRCodeSuggestions:
             if new_code_snippet and has_valid_anchor:
                 new_code_snippet = self.dedent_code(relevant_file, relevant_lines_start, new_code_snippet)
 
+            requires_pr_fallback = False
+            if d.get('_is_truncated'):
+                is_applicable = False
+                fallback_reason = "the proposed code was truncated"
+                requires_pr_fallback = True
+            elif new_code_snippet and is_applicable:
+                python_syntax_is_valid = self._validate_python_replacement_syntax(
+                    relevant_file,
+                    relevant_lines_start,
+                    relevant_lines_end,
+                    new_code_snippet,
+                )
+                if python_syntax_is_valid is False:
+                    is_applicable = False
+                    fallback_reason = "the proposed Python code has invalid syntax"
+                    requires_pr_fallback = True
+
             score = d.get("score")
             header = f"**Suggestion:** {content} [{label}, importance: {score}]" if score \
                 else f"**Suggestion:** {content} [{label}]"
@@ -923,8 +948,11 @@ class PRCodeSuggestions:
                 if new_code_snippet:
                     body += (f"\n\nProposed code (not offered as a committable change because {fallback_reason}):\n"
                              f"```\n{new_code_snippet}\n```")
+                elif requires_pr_fallback:
+                    body += f"\n\nNot offered as a committable change because {fallback_reason}."
 
-            if not has_valid_anchor:
+            # Keep safety-rejected suggestions out of provider patch APIs while preserving standalone artifacts.
+            if not has_valid_anchor or (requires_pr_fallback and not supports_suggestions_artifact):
                 fallback_comments.append(f"{body}\n\nLocation: `{relevant_file}:"
                                          f"{relevant_lines_start}-{relevant_lines_end}`")
             else:
@@ -961,6 +989,47 @@ class PRCodeSuggestions:
             if file.filename and file.filename.strip() == relevant_file:
                 return file
         return None
+
+    def _validate_python_replacement_syntax(
+        self,
+        relevant_file: str,
+        relevant_lines_start: int,
+        relevant_lines_end: int,
+        new_code_snippet: str,
+    ) -> Optional[bool]:
+        """Return False only when a verified replacement makes valid Python fail compilation."""
+        if not relevant_file.lower().endswith((".py", ".pyi", ".pyw")):
+            return None
+
+        diff_file = self._get_diff_file(relevant_file)
+        if (diff_file is None
+                or not diff_file.head_file
+                or not getattr(diff_file, "head_file_is_complete", True)):
+            return None
+
+        try:
+            compile(diff_file.head_file, relevant_file, "exec", dont_inherit=True)
+        except (SyntaxError, ValueError):
+            return None
+        except Exception as e:
+            get_logger().warning(f"Could not validate Python suggestion syntax: {e}")
+            return None
+
+        file_lines = diff_file.head_file.splitlines()
+        if (relevant_lines_start < 1
+                or relevant_lines_end < relevant_lines_start
+                or relevant_lines_end > len(file_lines)):
+            return None
+        file_lines[relevant_lines_start - 1:relevant_lines_end] = new_code_snippet.splitlines()
+
+        try:
+            compile("\n".join(file_lines), relevant_file, "exec", dont_inherit=True)
+        except (SyntaxError, ValueError):
+            return False
+        except Exception as e:
+            get_logger().warning(f"Could not validate Python suggestion syntax: {e}")
+            return None
+        return True
 
     @staticmethod
     def _get_patch_range_lines(patch, relevant_lines_start, relevant_lines_end) -> Optional[List[str]]:
@@ -1546,12 +1615,17 @@ class PRCodeSuggestions:
             for i, suggestion in enumerate(suggestion_list):
                 suggestion_str += f"suggestion {i + 1}: " + str(suggestion) + '\n\n'
 
+            is_ai_metadata = get_settings().get("config.enable_ai_metadata", False)
             variables = {'suggestion_list': suggestion_list,
                          'suggestion_str': suggestion_str,
                          "diff": patches_diff,
                          'num_code_suggestions': len(suggestion_list),
                          'prev_suggestions_str': prev_suggestions_str,
-                         "is_ai_metadata": get_settings().get("config.enable_ai_metadata", False),
+                         "is_ai_metadata": is_ai_metadata,
+                         "diff_hunk_format": render_diff_hunk_format(
+                             include_line_numbers=True,
+                             include_ai_metadata=is_ai_metadata,
+                         ),
                          'duplicate_prompt_examples': get_settings().config.get('duplicate_prompt_examples', False)}
             environment = Environment(undefined=StrictUndefined)
 

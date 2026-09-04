@@ -61,7 +61,7 @@ dependencies = [
   "tiktoken==0.12.0",
   "ujson>=5.13.0,<6",
   "unidiff==0.7.5",
-  "uvicorn==0.22.0",
+  "uvicorn>=0.31.1,<1",
   "tenacity==8.2.3",
   "a2a-sdk[http-server]==1.0.3",
   "langfuse==3.14.5",
@@ -120,7 +120,7 @@ similar-issue = [
   "pandas",  # imported directly by the qdrant indexing path
   "pinecone-client",
   "pinecone-datasets @ git+https://github.com/mrT23/pinecone-datasets.git@main",
-  "lancedb==0.5.1",
+  "lancedb==0.38.0",
   "qdrant-client==1.15.1",
 ]
 dev = [
@@ -192,9 +192,9 @@ tests = []
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
-testpaths = ["tests"]
+testpaths = ["tests/unittest"]
 python_files = ["test_*.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]
-addopts = "--color=yes"
+addopts = "--color=yes --import-mode=importlib"
 console_output_style = "progress"
