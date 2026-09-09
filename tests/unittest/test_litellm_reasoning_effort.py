@@ -1384,3 +1384,19 @@ class TestLiteLLMReasoningEffortGrok:
         )
 
         assert call_kwargs["extra_body"]["reasoning"] == {"effort": "high"}
+
+    @pytest.mark.asyncio
+    async def test_glm_flash_routes_through_extra_body(self, monkeypatch, mock_logger):
+        """glm-5.3-flash uses the same extra_body reasoning routing as glm-5.3."""
+        fake_settings = create_mock_settings("medium")
+        monkeypatch.setattr(litellm_handler, "get_settings", lambda: fake_settings)
+
+        with patch('pr_agent.algo.ai_handlers.litellm_ai_handler.acompletion', new_callable=AsyncMock) as mock_completion:
+            mock_completion.return_value = create_mock_acompletion_response()
+
+            handler = LiteLLMAIHandler()
+            await handler.chat_completion(model="openai/glm-5.3-flash", system="test system", user="test user")
+
+            call_kwargs = mock_completion.call_args[1]
+            assert "reasoning_effort" not in call_kwargs
+            assert call_kwargs["extra_body"]["reasoning"]["effort"] == "medium"
