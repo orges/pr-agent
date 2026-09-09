@@ -235,7 +235,7 @@ class TestPathBasedRouting:
 
     def test_first_match_wins_with_path_rules(self):
         self._rules([
-            {"include_paths": ["*.stories.tsx"], "model": "story-model"},
+            {"include_paths": ["*.stories.tsx"], "min_share": 0.5, "model": "story-model"},
             {"include_paths": ["*.tsx"], "model": "ui-model"},
         ])
         provider = _Provider([_file("src/Button.tsx", 1), _file("src/Button.stories.tsx", 1)])
