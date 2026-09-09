@@ -13,7 +13,7 @@ from pr_agent.agent.pr_agent import PRAgent, prepare_command
 from pr_agent.config_loader import get_settings, global_settings
 from pr_agent.git_providers.utils import apply_repo_settings
 from pr_agent.log import LoggingFormat, get_logger, setup_logger
-from pr_agent.servers.utils import verify_signature
+from pr_agent.servers.utils import get_pr_commands, push_trigger_slot, verify_signature
 
 # Setup logging and router
 setup_logger(fmt=LoggingFormat.JSON, level=get_settings().get("CONFIG.LOG_LEVEL", "DEBUG"))
@@ -106,7 +106,9 @@ async def handle_pr_event(body: Dict[str, Any], event: str, action: str, agent: 
             get_logger().info("Push event, but no push commands found or push trigger is disabled")
             return
         get_logger().debug(f'A push event has been received: {api_url}')
-        await _perform_commands_gitea("push_commands", agent, body, api_url)
+        async with push_trigger_slot(api_url, allow_backlog=True, ttl=300) as proceed:
+            if proceed:
+                await _perform_commands_gitea("push_commands", agent, body, api_url)
         # for command in commands_on_push:
         #     await agent.handle_request(api_url, command)
 
@@ -133,7 +135,11 @@ async def _perform_commands_gitea(commands_conf: str, agent: PRAgent, body: dict
         return
     if not should_process_pr_logic(body): # Here we already updated the configuration with the repo settings
         return {}
-    commands = get_settings().get(f"gitea.{commands_conf}")
+    commands = (
+        get_pr_commands("gitea")
+        if commands_conf == "pr_commands"
+        else get_settings().get(f"gitea.{commands_conf}")
+    )
     if not commands:
         get_logger().info("New PR, but no auto commands configured")
         return

@@ -2,7 +2,7 @@ In this page we will cover how to install and run PR-Agent as a GitHub Action or
 
 ## Run as a GitHub Action
 
-You can use our pre-built Github Action Docker image to run PR-Agent as a Github Action.
+You can use our pre-built GitHub Action Docker image to run PR-Agent as a GitHub Action.
 
 1) Add the following file to your repository under `.github/workflows/pr_agent.yml`:
 
@@ -442,6 +442,8 @@ max_artifact_size = 50000                                   # characters; longer
 !!! note
     A path that resolves outside `GITHUB_WORKSPACE` is rejected, and a missing or unreadable file is skipped with a warning — in both cases the tools still run, just without the artifact context.
 
+The same settings apply when PR-Agent runs as a CLI from another CI system, with `ARTIFACT_PATH` set in the job's environment; see the [GitLab pipeline example](./gitlab.md#ci-artifact-context).
+
 #### Using Configuration Files
 
 Instead of setting all options via environment variables, you can use a `.pr_agent.toml` file in your repository root:
@@ -649,7 +651,7 @@ For more detailed configuration options, see:
 
 Allowing you to automate the review process on your private or public repositories.
 
-1) Create a GitHub App from the [Github Developer Portal](https://docs.github.com/en/developers/apps/creating-a-github-app).
+1) Create a GitHub App from the [GitHub Developer Portal](https://docs.github.com/en/developers/apps/creating-a-github-app).
 
    - Set the following permissions:
      - Pull requests: Read & write

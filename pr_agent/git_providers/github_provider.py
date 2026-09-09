@@ -11,7 +11,7 @@ from datetime import datetime
 from typing import Optional, Tuple
 from urllib.parse import urlparse
 
-from github import AppAuthentication, Auth, Github, GithubException
+from github import AppAuthentication, Auth, Github, GithubException, GithubIntegration
 from github.Issue import Issue
 from retry.api import retry_call
 from starlette_context import context
@@ -44,7 +44,6 @@ from .git_provider import (
     FilePatchInfo,
     GitProvider,
     IncrementalPR,
-    get_cached_global_settings,
     redact_credentials,
 )
 
@@ -111,8 +110,9 @@ class GithubProvider(GitProvider):
             get_logger().exception(f"Failed to get an issue object for issue: {issue_url}, belonging to owner/repo: {repo_name}")
             return None
 
-    def get_incremental_commits(self, incremental=IncrementalPR(False)):
-        self.incremental = incremental
+    def get_incremental_commits(self, incremental: Optional[IncrementalPR] = None):
+        # Constructed per call: a default in the signature is one object shared by every provider that omits it.
+        self.incremental = incremental if incremental is not None else IncrementalPR(False)
         if self.incremental.is_incremental:
             self.unreviewed_files_map = dict()
             self._get_incremental_commits()
@@ -123,6 +123,12 @@ class GithubProvider(GitProvider):
         return True
 
     def supports_line_question_history(self) -> bool:
+        return True
+
+    def supports_checkbox_commands(self) -> bool:
+        return True
+
+    def supports_pr_chat(self) -> bool:
         return True
 
     def _get_owner_and_repo_path(self, given_url: str) -> str:
@@ -432,6 +438,105 @@ class GithubProvider(GitProvider):
     def supports_review_comment_identity(self) -> bool:
         return True
 
+    def supports_review_finding_state(self) -> bool:
+        deployment_type = self._deployment_type()
+        # User deployments resolve the authenticated account through the API.
+        # App deployments resolve their own `<slug>[bot]` login through the app JWT.
+        if deployment_type == "user":
+            return True
+        if deployment_type == "app":
+            return bool(self._agent_login())
+        return False
+
+    def _deployment_type(self) -> str:
+        deployment_type = getattr(self, "deployment_type", None)
+        if deployment_type is None:
+            deployment_type = get_settings().get("GITHUB.DEPLOYMENT_TYPE", "user")
+        return deployment_type
+
+    def _resolve_app_login(self) -> str:
+        """Return the app's own `<slug>[bot]` login, or "" when it cannot be resolved.
+
+        An app authenticates the API with an installation token, which cannot call
+        `GET /user`. The app's slug comes from the app JWT instead, so the identity does
+        not depend on PR-Agent having already commented on the pull request.
+        """
+        cached = getattr(self, "_app_login", None)
+        if isinstance(cached, str) and cached:
+            return cached
+        try:
+            integration = GithubIntegration(
+                integration_id=str(get_settings().github.app_id),
+                private_key=get_settings().github.private_key,
+                base_url=self.base_url,
+            )
+            slug = (getattr(integration.get_app(), "slug", "") or "").strip()
+            if slug:
+                # Only a success is cached. Caching the failure too would let one timed-out
+                # `GET /app` demote every later command in the same request, which is the
+                # behaviour this change exists to remove.
+                self._app_login = f"{slug}[bot]"
+                return self._app_login
+        except Exception as e:
+            get_logger().warning(f"Could not resolve the GitHub App login: {e}")
+        return ""
+
+    def _resolve_user_login(self) -> str:
+        """Return the authenticated login, falling back to the Actions bot identity.
+
+        The workflow token cannot call `GET /user`, but every comment it posts is authored by
+        `github-actions[bot]`.
+
+        This fallback is a deliberate widening, and the one place where the identity is assumed
+        rather than read: inside a GitHub Actions run the workflow token is the only credential
+        PR-Agent has, so a comment marked as PR-Agent's and authored by `github-actions[bot]`
+        will be edited. Anything else in the same workflow that posts under the workflow token -
+        another action, another step - shares that identity. The exposure is bounded by the
+        identity marker (the comment must already carry PR-Agent's own marker) and by the fact
+        that GitHub reserves the `[bot]` suffix, so no human account can hold this login. It
+        applies only when `GITHUB_ACTIONS=true` and `GET /user` failed; a deployment that can
+        resolve its real login never reaches it.
+        """
+        try:
+            login = self.get_user_id()
+        except Exception as e:
+            get_logger().warning(f"Could not resolve the GitHub user login: {e}")
+            login = ""
+        if isinstance(login, str) and login.strip():
+            return login.strip()
+        if os.getenv("GITHUB_ACTIONS", "").strip().lower() == "true":
+            return "github-actions[bot]"
+        return ""
+
+    def _agent_login(self) -> str:
+        """Login PR-Agent posts as, or "" when this deployment cannot establish one."""
+        cached = getattr(self, "github_user_id", None)
+        if isinstance(cached, str) and cached.strip():
+            return cached.strip()
+        if self._deployment_type() == "app":
+            return self._resolve_app_login()
+        return self._resolve_user_login()
+
+    def is_comment_authored_by_pr_agent(self, comment) -> bool:
+        if isinstance(comment, dict):
+            author = comment.get("user") or comment.get("author")
+        else:
+            author = getattr(comment, "user", None) or getattr(comment, "author", None)
+        if isinstance(author, dict):
+            login = author.get("login")
+        else:
+            login = getattr(author, "login", None)
+        if not isinstance(login, str) or not login.strip():
+            raise RuntimeError("GitHub comment author cannot be verified")
+
+        if self._deployment_type() not in {"user", "app"}:
+            raise RuntimeError("Unsupported GitHub deployment identity")
+
+        agent_login = self._agent_login()
+        if not agent_login:
+            raise RuntimeError("GitHub identity cannot be verified")
+        return login.casefold() == agent_login.casefold()
+
     def _publish_check_run(self, text: str, name: str) -> bool:
         if not getattr(self, 'last_commit_id', None):
             get_logger().error("Cannot publish check run without a commit SHA")
@@ -595,7 +700,7 @@ class GithubProvider(GitProvider):
                 get_logger().info(
                     f"Persistent inline comments: all {skipped} suggestion(s) "
                     f"already posted; nothing to publish")
-                return
+                return True
             comments = deduped
         else:
             comments = [
@@ -614,6 +719,7 @@ class GithubProvider(GitProvider):
                 for body_fp, code_fp in pending_fingerprints:
                     store.add(body_fp)
                     store.add(code_fp)
+            return True
         except Exception as e:
             get_logger().info("Initially failed to publish inline comments as committable")
 
@@ -623,7 +729,8 @@ class GithubProvider(GitProvider):
                 raise e # will end up with publishing the comments one by one
 
             try:
-                self._publish_inline_comments_fallback_with_verification(comments)
+                published_count = self._publish_inline_comments_fallback_with_verification(comments)
+                return bool(published_count)
             except Exception as e:
                 get_logger().error(f"Failed to publish inline code comments fallback, error: {e}")
                 raise
@@ -788,11 +895,13 @@ class GithubProvider(GitProvider):
         then publish all the remaining valid comments in a single review.
         For invalid comments, also try removing the suggestion part and posting the comment just on the first line.
         """
+        published_count = 0
         verified_comments, invalid_comments = self._verify_code_comments(comments)
 
         # publish as a group the verified comments
         if verified_comments:
             self.pr.create_review(commit=self.last_commit_id, comments=verified_comments)
+            published_count += len(verified_comments)
 
         # try to publish one by one the invalid comments as a one-line code comment
         if invalid_comments and get_settings().github.try_fix_invalid_inline_comments:
@@ -800,9 +909,10 @@ class GithubProvider(GitProvider):
             fixed_comments_as_one_liner = self._try_fix_invalid_inline_comments(invalid_comments_list)
             for comment in fixed_comments_as_one_liner:
                 try:
-                    self.publish_inline_comments([comment], disable_fallback=True)
-                    get_logger().info(f"Published invalid comment as a single line comment: {comment}")
-                except:
+                    if self.publish_inline_comments([comment], disable_fallback=True):
+                        published_count += 1
+                        get_logger().info(f"Published invalid comment as a single line comment: {comment}")
+                except Exception:
                     get_logger().error(f"Failed to publish invalid comment as a single line comment: {comment}")
 
             dropped_count = len(invalid_comments) - len(fixed_comments_as_one_liner)
@@ -821,6 +931,7 @@ class GithubProvider(GitProvider):
                 f"Dropped {len(invalid_comments)} invalid comments "
                 f"(try_fix_invalid_inline_comments is off). Paths: {dropped_paths}"
             )
+        return published_count
 
     def _verify_code_comment(self, comment: dict):
         is_verified = False
@@ -930,8 +1041,7 @@ class GithubProvider(GitProvider):
             post_parameters_list.append(post_parameters)
 
         try:
-            self.publish_inline_comments(post_parameters_list)
-            return True
+            return bool(self.publish_inline_comments(post_parameters_list))
         except Exception as e:
             get_logger().error(f"Failed to publish code suggestion, error: {e}")
             return False
@@ -948,6 +1058,10 @@ class GithubProvider(GitProvider):
                     artifact={"error": e})
             else:
                 get_logger().exception("Failed to edit github comment", artifact={"error": e})
+            return False
+        except Exception as e:
+            get_logger().exception("Failed to edit github comment", artifact={"error": e})
+            return False
 
     def edit_comment_from_comment_id(self, comment_id: int, body: str):
         try:
@@ -1045,6 +1159,13 @@ class GithubProvider(GitProvider):
             return None
         return self.repo.split('/')[0]
 
+    def get_owning_namespace(self) -> Optional[str]:
+        # Be robust to providers built without full __init__ (e.g. __new__ in tests/helpers):
+        # without a repo there is no org to resolve, so skip global settings quietly.
+        if not getattr(self, "repo", None):
+            return None
+        return self.repo.split('/')[0]
+
     def get_pr_description_full(self):
         return self.pr.body
 
@@ -1117,23 +1238,10 @@ class GithubProvider(GitProvider):
 
         return settings_files if settings_files else ""
 
-    def _get_global_repo_settings(self):
-        if not get_settings().config.use_global_settings_file:
-            return ""
-
-        # Be robust to providers built without full __init__ (e.g. __new__ in tests/helpers):
-        # without a repo/client there is no org to resolve, so skip global settings quietly.
-        if not getattr(self, "repo", None) or getattr(self, "github_client", None) is None:
-            return ""
-
-        repo_owner = self.get_pr_owner_id()
-        if not repo_owner:
-            return ""
-        # Cache per org: global settings change rarely, so avoid a lookup (and repeated 403/404
-        # fallbacks) on every webhook event.
-        return get_cached_global_settings(
-            f"github:{getattr(self, 'base_url', '')}:{repo_owner}",
-            lambda: self._fetch_global_repo_settings(repo_owner))
+    def _get_global_settings_cache_key(self, repo_owner: str) -> str:
+        # Cache per org AND host: the same org name on two different hosts (github.com vs a
+        # self-hosted GitHub Enterprise instance) must not share a settings entry.
+        return f"github:{getattr(self, 'base_url', '')}:{repo_owner}"
 
     def _fetch_global_repo_settings(self, repo_owner):
         try:
@@ -1178,17 +1286,23 @@ class GithubProvider(GitProvider):
     def get_workspace_name(self):
         return self.repo.split('/')[0]
 
-    def add_eyes_reaction(self, issue_comment_id: int, disable_eyes: bool = False) -> Optional[int]:
-        if disable_eyes:
+    # The reaction API accepts only this closed set; anything else is rejected with 422.
+    SUPPORTED_REACTIONS = ("+1", "-1", "laugh", "confused", "heart", "hooray", "rocket", "eyes")
+
+    def add_reaction(self, issue_comment_id: int, reaction: str) -> Optional[int]:
+        if reaction not in self.SUPPORTED_REACTIONS:
+            get_logger().warning(
+                f"GitHub does not support the reaction {reaction!r}; "
+                f"choose one of {', '.join(self.SUPPORTED_REACTIONS)}")
             return None
         try:
             headers, data_patch = self.pr._requester.requestJsonAndCheck(
                 "POST", f"{self.base_url}/repos/{self.repo}/issues/comments/{issue_comment_id}/reactions",
-                input={"content": "eyes"}
+                input={"content": reaction}
             )
             return data_patch.get("id", None)
         except Exception as e:
-            get_logger().warning(f"Failed to add eyes reaction, error: {e}")
+            get_logger().warning(f"Failed to add the {reaction} reaction, error: {e}")
             return None
 
     def remove_reaction(self, issue_comment_id: int, reaction_id: str) -> bool:
@@ -1525,7 +1639,7 @@ class GithubProvider(GitProvider):
                 return sub_issues
 
             nodes = sub_issues_data.get("nodes") or []
-            get_logger().info(f"Github Sub-issues fetched: {len(nodes)}", artifact={"nodes": nodes})
+            get_logger().info(f"GitHub Sub-issues fetched: {len(nodes)}", artifact={"nodes": nodes})
 
             for sub_issue in nodes:
                 if not sub_issue:

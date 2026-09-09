@@ -50,6 +50,19 @@ class MethodContract:
     check_supported: Callable[[object], None]
     tiers: dict[str, Tier]
     check_return_annotation: bool = True
+    check_execution: bool = True
+
+
+@dataclass(frozen=True)
+class DeliberateMismatch:
+    reason: str
+
+
+@dataclass(frozen=True)
+class PredicateContract:
+    name: str
+    evidence: tuple[str, ...]
+    deliberate_mismatches: dict[str, DeliberateMismatch]
 
 
 def _github(monkeypatch) -> GithubProvider:
@@ -112,6 +125,29 @@ def _azure_devops(monkeypatch) -> AzureDevopsProvider:
     return provider
 
 
+def _bitbucket_server(monkeypatch) -> BitbucketServerProvider:
+    provider = BitbucketServerProvider.__new__(BitbucketServerProvider)
+    provider.workspace_slug = "PRJ"
+    provider.repo_slug = "repo"
+    provider.pr_num = 7
+    provider.bitbucket_client = MagicMock()
+    provider.bitbucket_client.get_pull_requests_activities.return_value = [{
+        "action": "COMMENTED",
+        "comment": {"id": COMMENT_ID, "version": 1, "text": COMMENT_BODY},
+    }]
+    return provider
+
+def _bitbucket(monkeypatch) -> BitbucketProvider:
+    provider = BitbucketProvider.__new__(BitbucketProvider)
+    provider.pr = MagicMock()
+
+    comment = MagicMock()
+    comment.raw = COMMENT_BODY
+    provider.pr.comments.return_value = [comment]
+
+    return provider
+
+
 def _bare(provider_type):
     """A provider with no backend wired at all: every call on it must succeed without one."""
     return lambda monkeypatch: provider_type.__new__(provider_type)
@@ -123,8 +159,8 @@ PROVIDERS: dict[str, tuple[type[GitProvider], Callable[[pytest.MonkeyPatch], Git
     "gitea": (GiteaProvider, _gitea),
     "gerrit": (GerritProvider, _gerrit),
     "azure-devops": (AzureDevopsProvider, _azure_devops),
-    "bitbucket": (BitbucketProvider, _bare(BitbucketProvider)),
-    "bitbucket-server": (BitbucketServerProvider, _bare(BitbucketServerProvider)),
+    "bitbucket": (BitbucketProvider, _bitbucket),
+    "bitbucket-server": (BitbucketServerProvider, _bitbucket_server),
     "codecommit": (CodeCommitProvider, _bare(CodeCommitProvider)),
     "local": (LocalGitProvider, _bare(LocalGitProvider)),
     "plain-diff": (PlainDiffGitProvider, _bare(PlainDiffGitProvider)),
@@ -159,6 +195,30 @@ def _is_success(value):
 
 REACTION_TIERS = _tiers(supported=("github", "gitlab", "gitea"), not_implemented=("gerrit",))
 
+PREDICATE_CONTRACTS = (
+    PredicateContract(
+        name="supports_review_comment_identity",
+        evidence=("publish_persistent_comment",),
+        deliberate_mismatches={
+            "gitea": DeliberateMismatch(
+                "Gitea forwards identity arguments but cannot safely activate identity tracking "
+                "until it normalizes dictionary-shaped comment payloads."
+            ),
+        },
+    ),
+    PredicateContract(
+        name="supports_thread_resolution",
+        evidence=("resolve_comment_thread",),
+        deliberate_mismatches={
+            "gitlab": DeliberateMismatch(
+                "GitLab resolves note IDs while /ask_line addresses discussion IDs, so thread resolution "
+                "must remain disabled."
+            ),
+        },
+    ),
+)
+
+
 METHOD_CONTRACTS = (
     MethodContract(
         name="get_commit_messages",
@@ -173,8 +233,8 @@ METHOD_CONTRACTS = (
         noop_value=[],
         check_supported=_is_comment_sequence,
         tiers=_tiers(
-            supported=("github", "gitlab", "gitea", "gerrit", "azure-devops"),
-            not_implemented=("bitbucket", "bitbucket-server", "codecommit", "local"),
+            supported=("github", "gitlab", "gitea", "gerrit", "azure-devops", "bitbucket-server", "bitbucket"),
+            not_implemented=("codecommit", "local"),
         ),
         # Implementations narrow the base `Iterable` (a paginated list, a list of SDK objects),
         # so the return annotation is checked by behaviour rather than by equality.
@@ -194,20 +254,79 @@ METHOD_CONTRACTS = (
         check_supported=_is_success,
         tiers=REACTION_TIERS,
     ),
+    MethodContract(
+        name="publish_inline_comment",
+        args=(),
+        noop_value=None,
+        check_supported=lambda _: None,
+        tiers=_tiers(),
+        # Signature-only contract: catches signature drift against GitProvider without
+        # requiring live backends or mock state for every provider.
+        check_return_annotation=False,
+        check_execution=False,
+    ),
 )
 
 
-def _rows(tier: Tier | None = None):
+def _rows(tier: Tier | None = None, check_execution_only: bool = False):
     for contract in METHOD_CONTRACTS:
+        if check_execution_only and not contract.check_execution:
+            continue
         for provider_name, provider_tier in contract.tiers.items():
             if tier is None or provider_tier is tier:
                 yield pytest.param(provider_name, contract, id=f"{provider_name}-{contract.name}")
+
+
+def _predicate_rows():
+    for contract in PREDICATE_CONTRACTS:
+        for provider_name in PROVIDERS:
+            yield pytest.param(provider_name, contract, id=f"{provider_name}-{contract.name}")
+
+
+def _has_evidence(provider_type: type[GitProvider], contract: PredicateContract) -> bool:
+    for name in contract.evidence:
+        member = getattr(provider_type, name, None)
+        if member is not getattr(GitProvider, name, None):
+            if contract.name == "supports_review_comment_identity":
+                if "identity_marker" in inspect.signature(member).parameters:
+                    return True
+            else:
+                return True
+    return False
 
 
 def test_every_registered_provider_has_a_contract_row():
     contracted = {provider_type for provider_type, _ in PROVIDERS.values()}
 
     assert set(_GIT_PROVIDERS.values()) <= contracted
+
+
+@pytest.mark.parametrize("provider_name,contract", tuple(_predicate_rows()))
+def test_predicate_truth_matches_evidence(provider_name: str, contract: PredicateContract):
+    provider_type, _ = PROVIDERS[provider_name]
+    mismatch = contract.deliberate_mismatches.get(provider_name)
+    predicate = getattr(provider_type.__new__(provider_type), contract.name)
+
+    if mismatch:
+        assert mismatch.reason.strip()
+        assert predicate() is False
+    else:
+        assert predicate() is _has_evidence(provider_type, contract)
+
+
+@pytest.mark.parametrize("contract", PREDICATE_CONTRACTS, ids=lambda contract: contract.name)
+def test_predicate_mismatches_name_only_providers_with_evidence(contract: PredicateContract):
+    for provider_name in contract.deliberate_mismatches:
+        provider_type, _ = PROVIDERS[provider_name]
+
+        assert _has_evidence(provider_type, contract)
+
+
+@pytest.mark.parametrize("contract", PREDICATE_CONTRACTS, ids=lambda contract: contract.name)
+def test_predicate_contract_evidence_members_exist_on_registered_providers(contract: PredicateContract):
+    assert contract.evidence
+    for member_name in contract.evidence:
+        assert any(hasattr(provider_type, member_name) for provider_type, _ in PROVIDERS.values())
 
 
 @pytest.mark.parametrize("contract", METHOD_CONTRACTS, ids=lambda contract: contract.name)
@@ -239,7 +358,7 @@ def test_implementation_declares_the_base_return_type(provider_name: str, contra
     assert implementation_hints.get("return") == base_hints["return"]
 
 
-@pytest.mark.parametrize("provider_name,contract", tuple(_rows(Tier.SUPPORTED)))
+@pytest.mark.parametrize("provider_name,contract", tuple(_rows(Tier.SUPPORTED, check_execution_only=True)))
 def test_supported_tier_returns_the_contract_value(provider_name: str, contract: MethodContract, monkeypatch):
     _, factory = PROVIDERS[provider_name]
     provider = factory(monkeypatch)
@@ -247,7 +366,7 @@ def test_supported_tier_returns_the_contract_value(provider_name: str, contract:
     contract.check_supported(getattr(provider, contract.name)(*contract.args))
 
 
-@pytest.mark.parametrize("provider_name,contract", tuple(_rows(Tier.NOOP)))
+@pytest.mark.parametrize("provider_name,contract", tuple(_rows(Tier.NOOP, check_execution_only=True)))
 def test_noop_tier_returns_the_empty_value_without_a_backend(provider_name: str, contract: MethodContract):
     provider_type, _ = PROVIDERS[provider_name]
     provider = provider_type.__new__(provider_type)
@@ -258,7 +377,7 @@ def test_noop_tier_returns_the_empty_value_without_a_backend(provider_name: str,
     assert result == contract.noop_value
 
 
-@pytest.mark.parametrize("provider_name,contract", tuple(_rows(Tier.NOT_IMPLEMENTED)))
+@pytest.mark.parametrize("provider_name,contract", tuple(_rows(Tier.NOT_IMPLEMENTED, check_execution_only=True)))
 def test_not_implemented_tier_raises(provider_name: str, contract: MethodContract):
     provider_type, _ = PROVIDERS[provider_name]
     provider = provider_type.__new__(provider_type)
@@ -276,3 +395,118 @@ def test_disable_eyes_short_circuits_before_any_backend_call(provider_name: str)
     provider = provider_type.__new__(provider_type)
 
     assert provider.add_eyes_reaction(COMMENT_ID, disable_eyes=True) is None
+
+
+@pytest.mark.parametrize(
+    "provider_name",
+    [
+        name
+        for name, (cls, _) in PROVIDERS.items()
+        if "publish_code_suggestions" in cls.__dict__
+    ],
+)
+def test_publish_code_suggestions_declares_bool_return(provider_name: str):
+    provider_type, _ = PROVIDERS[provider_name]
+    hints = get_type_hints(provider_type.publish_code_suggestions)
+    assert hints.get("return") is bool
+
+
+def test_gerrit_publish_code_suggestions_returns_false_on_total_failure(monkeypatch, tmp_path):
+    provider = GerritProvider.__new__(GerritProvider)
+    provider.parsed_url = SimpleNamespace()
+    provider.refspec = "refs/changes/1"
+    provider.repo_path = str(tmp_path)
+    (tmp_path / "app.py").write_text("orig\n")
+
+    monkeypatch.setattr(
+        "pr_agent.git_providers.gerrit_provider.upload_patch",
+        lambda *_: "https://patch.example/1",
+    )
+    monkeypatch.setattr(
+        "pr_agent.git_providers.gerrit_provider.diff",
+        lambda *_, **__: "patch",
+    )
+    monkeypatch.setattr(
+        "pr_agent.git_providers.gerrit_provider.reset_local_changes",
+        lambda *_: None,
+    )
+
+    def _fail_comment(*_):
+        raise RuntimeError("network down")
+
+    monkeypatch.setattr("pr_agent.git_providers.gerrit_provider.add_comment", _fail_comment)
+
+    suggestions = [{
+        "relevant_file": "app.py",
+        "body": "description\n```suggestion\nnew\n```",
+        "relevant_lines_start": 1,
+        "relevant_lines_end": 1,
+    }]
+    assert provider.publish_code_suggestions(suggestions) is False
+
+
+def test_gerrit_publish_code_suggestions_returns_true_on_success(monkeypatch, tmp_path):
+    provider = GerritProvider.__new__(GerritProvider)
+    provider.parsed_url = SimpleNamespace()
+    provider.refspec = "refs/changes/1"
+    provider.repo_path = str(tmp_path)
+    (tmp_path / "app.py").write_text("orig\n")
+
+    monkeypatch.setattr(
+        "pr_agent.git_providers.gerrit_provider.upload_patch",
+        lambda *_: "https://patch.example/1",
+    )
+    monkeypatch.setattr(
+        "pr_agent.git_providers.gerrit_provider.diff",
+        lambda *_, **__: "patch",
+    )
+    monkeypatch.setattr(
+        "pr_agent.git_providers.gerrit_provider.reset_local_changes",
+        lambda *_: None,
+    )
+    monkeypatch.setattr(
+        "pr_agent.git_providers.gerrit_provider.add_comment",
+        lambda *_: None,
+    )
+
+    suggestions = [{
+        "relevant_file": "app.py",
+        "body": "description\n```suggestion\nnew\n```",
+        "relevant_lines_start": 1,
+        "relevant_lines_end": 1,
+    }]
+    assert provider.publish_code_suggestions(suggestions) is True
+
+
+def test_codecommit_publish_code_suggestions_returns_false_when_no_publishable_targets():
+    provider = CodeCommitProvider.__new__(CodeCommitProvider)
+    provider.pr_num = 123
+    provider.codecommit_client = MagicMock()
+    provider._get_target_contexts_for_file = MagicMock(return_value=[])
+
+    suggestions = [{
+        "body": "suggestion",
+        "relevant_file": "app.py",
+        "relevant_lines_start": 1,
+    }]
+    assert provider.publish_code_suggestions(suggestions) is False
+    provider.codecommit_client.publish_comment.assert_not_called()
+
+
+def test_codecommit_publish_code_suggestions_returns_true_on_success():
+    provider = CodeCommitProvider.__new__(CodeCommitProvider)
+    provider.pr_num = 123
+    provider.codecommit_client = MagicMock()
+    provider._get_target_contexts_for_file = MagicMock(return_value=[{
+        "repository_name": "repo",
+        "destination_commit": "dest",
+        "source_commit": "src",
+    }])
+
+    suggestions = [{
+        "body": "suggestion",
+        "relevant_file": "app.py",
+        "relevant_lines_start": 1,
+    }]
+    assert provider.publish_code_suggestions(suggestions) is True
+    provider.codecommit_client.publish_comment.assert_called_once()
