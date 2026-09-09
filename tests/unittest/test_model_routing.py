@@ -187,3 +187,61 @@ class TestAzureDeployments:
         asyncio.run(retry_with_fallback_models(fake_f, git_provider=_pr(num_files=1, hunks_per_file=1)))
 
         assert observed == [("tiny-model", "tiny-deployment"), ("fallback-1", "fallback-deployment")]
+
+
+class TestPathBasedRouting:
+    """include_paths / exclude_paths predicates select the primary by changed-file shape."""
+
+    def _rules(self, rules):
+        get_settings().set("model_routing.rules", rules)
+
+    def test_include_paths_share_routes_frontend_pr(self):
+        self._rules([{"include_paths": ["*.tsx", "*.css", "*.vue"], "model": "ui-model"}])
+        provider = _Provider([_file("src/app/page.tsx", 2), _file("src/ui/Button.tsx", 1),
+                              _file("src/app/page.css", 1), _file("src/lib/api.ts", 1)])
+        result = route_primary_model(ModelType.REGULAR, provider)
+        assert result == ("ui-model", None)
+
+    def test_include_paths_below_min_share_keeps_primary(self):
+        self._rules([{"include_paths": ["*.tsx"], "model": "ui-model"}])
+        provider = _Provider([_file("src/a.tsx", 1), _file("src/api1.py", 2), _file("src/api2.py", 2)])
+        assert route_primary_model(ModelType.REGULAR, provider) is None
+
+    def test_min_share_override(self):
+        self._rules([{"include_paths": ["*.tsx"], "min_share": 0.25, "model": "ui-model"}])
+        provider = _Provider([_file("src/a.tsx", 1), _file("src/api1.py", 2), _file("src/api2.py", 2)])
+        assert route_primary_model(ModelType.REGULAR, provider) == ("ui-model", None)
+
+    def test_exclude_paths_alone_routes_when_no_match(self):
+        self._rules([{"exclude_paths": ["*.tsx", "*.css", "*.vue"], "model": "backend-model"}])
+        backend_only = _Provider([_file("src/api.ts", 2), _file("src/db.py", 3)])
+        assert route_primary_model(ModelType.REGULAR, backend_only) == ("backend-model", None)
+        mixed = _Provider([_file("src/api.ts", 2), _file("src/ui.css", 1)])
+        assert route_primary_model(ModelType.REGULAR, mixed) is None
+
+    def test_exclude_paths_subtracts_from_include_share(self):
+        self._rules([{"include_paths": ["src/**"], "exclude_paths": ["*.md"], "model": "src-model"}])
+        provider = _Provider([_file("src/a.ts", 1), _file("src/b.ts", 1),
+                              _file("src/README.md", 1), _file("docs/x.md", 1)])
+        # include matches 3/4 files; the excluded src/README.md drops it to 2/4 = 0.5 < 0.6
+        assert route_primary_model(ModelType.REGULAR, provider) is None
+
+    def test_path_and_size_predicates_combine_with_and(self):
+        self._rules([{"include_paths": ["*.tsx"], "max_files": 2, "model": "small-ui-model"}])
+        fits = _Provider([_file("a.tsx", 1), _file("b.tsx", 1)])
+        assert route_primary_model(ModelType.REGULAR, fits) == ("small-ui-model", None)
+        too_big = _Provider([_file(f"{i}.tsx", 1) for i in range(5)])
+        assert route_primary_model(ModelType.REGULAR, too_big) is None
+
+    def test_first_match_wins_with_path_rules(self):
+        self._rules([
+            {"include_paths": ["*.stories.tsx"], "model": "story-model"},
+            {"include_paths": ["*.tsx"], "model": "ui-model"},
+        ])
+        provider = _Provider([_file("src/Button.tsx", 1), _file("src/Button.stories.tsx", 1)])
+        assert route_primary_model(ModelType.REGULAR, provider) == ("story-model", None)
+
+    def test_rule_with_only_model_still_rejected(self):
+        self._rules([{"model": "no-predicate-model"}])
+        provider = _Provider([_file("a.py", 1)])
+        assert route_primary_model(ModelType.REGULAR, provider) is None
