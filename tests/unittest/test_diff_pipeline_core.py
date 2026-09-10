@@ -646,3 +646,15 @@ class TestTrailingDeletionOnlyHunk:
         assert "__old hunk__" in out
         for line in ("-a", "-b", "-c", "+added"):
             assert line in out
+
+
+class TestLanguagesDictShape:
+    """PyGithub 2.x leaks a 'url' (str) entry into get_languages(); sorting must survive it."""
+
+    def test_sort_files_by_main_languages_ignores_non_numeric_entries(self):
+        from pr_agent.algo.language_handler import sort_files_by_main_languages
+        languages = {"TypeScript": 807642, "CSS": 115507, "url": "https://api.github.com/r/l"}
+        files = ["a.css", "b.tsx"]
+        result = sort_files_by_main_languages(languages, files)
+        assert sorted(result) == sorted(files)
+        assert isinstance(result, list) and len(result) == 2

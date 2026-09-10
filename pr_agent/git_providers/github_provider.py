@@ -1161,7 +1161,9 @@ class GithubProvider(GitProvider):
 
     def get_languages(self):
         languages = self._get_repo().get_languages()
-        return languages
+        # PyGithub 2.x leaks a 'url' entry (str) into the languages dict; keep only
+        # numeric byte counts so downstream sorting never compares str with int.
+        return {k: v for k, v in dict(languages).items() if isinstance(v, (int, float))}
 
     def get_pr_branch(self):
         return self.pr.head.ref
