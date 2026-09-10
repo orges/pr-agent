@@ -192,6 +192,15 @@ class TestAzureDeployments:
 class TestPathBasedRouting:
     """include_paths / exclude_paths predicates select the primary by changed-file shape."""
 
+    @pytest.fixture(autouse=True)
+    def _routing_settings(self):
+        snapshot = snapshot_settings(_TRACKED_KEYS)
+        s = get_settings()
+        s.set("model_routing.enable", True)
+        s.set("openai.deployment_id", None)
+        yield
+        restore_settings(snapshot)
+
     def _rules(self, rules):
         get_settings().set("model_routing.rules", rules)
 
