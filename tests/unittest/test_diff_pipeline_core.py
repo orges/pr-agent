@@ -653,8 +653,9 @@ class TestLanguagesDictShape:
 
     def test_sort_files_by_main_languages_ignores_non_numeric_entries(self):
         from pr_agent.algo.language_handler import sort_files_by_main_languages
+        from pr_agent.algo.types import FilePatchInfo
         languages = {"TypeScript": 807642, "CSS": 115507, "url": "https://api.github.com/r/l"}
-        files = ["a.css", "b.tsx"]
-        result = sort_files_by_main_languages(languages, files)
-        assert sorted(result) == sorted(files)
-        assert isinstance(result, list) and len(result) == 2
+        files = [FilePatchInfo(base_file="", head_file="", patch="@@ -1 +1 @@\n+a\n", filename=f)
+                 for f in ("a.css", "b.tsx")]
+        buckets = sort_files_by_main_languages(languages, files)
+        assert [(b["language"], [f.filename for f in b["files"]]) for b in buckets][0][0] == "TypeScript"
