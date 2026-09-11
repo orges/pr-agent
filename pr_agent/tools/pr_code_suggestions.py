@@ -10,7 +10,6 @@ from typing import Dict, List, Optional
 
 from jinja2 import Environment, StrictUndefined
 
-from pr_agent.algo import MAX_TOKENS
 from pr_agent.algo.ai_handlers.base_ai_handler import BaseAiHandler
 from pr_agent.algo.ai_handlers.litellm_ai_handler import LiteLLMAIHandler
 from pr_agent.algo.git_patch_processing import decouple_and_convert_to_hunks_with_lines_numbers
@@ -1043,7 +1042,9 @@ class PRCodeSuggestions:
 
     async def push_inline_code_suggestions(self, data, include_coverage_footer: bool = True) -> None:
         code_suggestions = []
+        artifact_suggestions = []
         fallback_comments = []
+        artifact_batch_published = False
         coverage_footer = self._get_suggestions_coverage_footer() if include_coverage_footer else ""
         supports_suggestions_artifact = self.git_provider.supports_code_suggestions_artifact() is True
 
@@ -1114,20 +1115,26 @@ class PRCodeSuggestions:
                 elif requires_pr_fallback:
                     body += f"\n\nNot offered as a committable change because {fallback_reason}."
 
-            # Keep safety-rejected suggestions out of provider patch APIs while preserving standalone artifacts.
+            rendered_suggestion = {'body': body, 'relevant_file': relevant_file,
+                                   'relevant_lines_start': relevant_lines_start,
+                                   'relevant_lines_end': relevant_lines_end,
+                                   'original_suggestion': d}
+            if supports_suggestions_artifact:
+                artifact_suggestions.append(rendered_suggestion)
+
+            # Keep safety-rejected suggestions out of provider patch APIs and retain fallback recovery text.
             if not has_valid_anchor or (requires_pr_fallback and not supports_suggestions_artifact):
                 fallback_comments.append(f"{body}\n\nLocation: `{relevant_file}:"
                                          f"{relevant_lines_start}-{relevant_lines_end}`")
             else:
-                code_suggestions.append({'body': body, 'relevant_file': relevant_file,
-                                         'relevant_lines_start': relevant_lines_start,
-                                         'relevant_lines_end': relevant_lines_end,
-                                         'original_suggestion': d})
+                code_suggestions.append(rendered_suggestion)
 
-        if code_suggestions:
+        suggestions_to_publish = artifact_suggestions if supports_suggestions_artifact else code_suggestions
+        if suggestions_to_publish:
             if supports_suggestions_artifact:
                 is_successful = self.git_provider.publish_code_suggestions_artifact(
-                    code_suggestions, artifact_footer=coverage_footer)
+                    suggestions_to_publish, artifact_footer=coverage_footer)
+                artifact_batch_published = is_successful
             else:
                 is_successful = self.git_provider.publish_code_suggestions(code_suggestions)
             if is_successful:
@@ -1140,7 +1147,7 @@ class PRCodeSuggestions:
                         self._output_published = True
         if coverage_footer and not supports_suggestions_artifact:
             fallback_comments.append(coverage_footer.strip())
-        if fallback_comments:
+        if fallback_comments and not artifact_batch_published:
             self.git_provider.publish_comment("\n\n---\n\n".join(fallback_comments))
             self._output_published = True
         if code_suggestions and not is_successful:
@@ -1616,11 +1623,8 @@ class PRCodeSuggestions:
                                                                                                           file=None).strip()
                         patches_new[i] = patches_new[i].strip()
                     patch_final = "\n\n\n".join(patches_new)
-                    if model in MAX_TOKENS:
-                        max_tokens_full = MAX_TOKENS[
-                            model]  # note - here we take the actual max tokens, without any reductions. we do aim to get the full documentation website in the prompt
-                    else:
-                        max_tokens_full = get_max_tokens(model)
+                    # take the actual max tokens, without any reductions
+                    max_tokens_full = get_max_tokens(model, ignore_max_model_tokens=True)
                     delta_output = 2000
                     token_count = self.token_handler.count_tokens(patch_final)
                     if token_count > max_tokens_full - delta_output:

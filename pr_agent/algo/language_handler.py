@@ -77,14 +77,21 @@ def build_language_file_matcher(language_extension_map: Dict) -> Callable[[str],
     return get_language
 
 
+def numeric_languages(languages: Dict) -> Dict:
+    """
+    Keep only the {language: size} entries of a provider's get_languages() result. PyGithub 2.x
+    adds a "url" string to every GET dict it returns, and a str cannot be ranked against sizes.
+    """
+    return {k: v for k, v in (languages or {}).items() if isinstance(v, (int, float))}
+
+
 def sort_files_by_main_languages(languages: Dict, files: list):
     """
     Sort files by their main language, put the files that are in the main language first and the rest files after
     """
-    # sort languages by their size; ignore non-numeric entries (e.g. PyGithub 2.x leaks
-    # a 'url' string into the dict) so the sort never compares str with int
-    numeric_languages = {k: v for k, v in languages.items() if isinstance(v, (int, float))}
-    languages_sorted_list = [k for k, v in sorted(numeric_languages.items(), key=lambda item: item[1], reverse=True)]
+    languages = numeric_languages(languages)
+    # sort languages by their size
+    languages_sorted_list = [k for k, v in sorted(languages.items(), key=lambda item: item[1], reverse=True)]
     # languages_sorted = sorted(languages, key=lambda x: x[1], reverse=True)
     # get all extensions for the languages
     language_extension_map_org = get_settings().language_extension_map_org
