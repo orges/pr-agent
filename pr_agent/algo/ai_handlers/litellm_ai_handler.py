@@ -191,6 +191,15 @@ PROVIDER_API_BASE_ENV_VARS = {
     "zai": ("ZAI_API_BASE",),
 }
 
+_WATSONX_ROUTING_ENV_VARS = {
+    "api_base": ("WATSONX_API_BASE", "WATSONX_URL", "WX_URL", "WML_URL"),
+    "project_id": ("WATSONX_PROJECT_ID", "WX_PROJECT_ID", "PROJECT_ID"),
+    "space_id": ("WATSONX_DEPLOYMENT_SPACE_ID", "WATSONX_SPACE_ID", "WX_SPACE_ID", "SPACE_ID"),
+    "region_name": ("WATSONX_REGION", "WX_REGION", "REGION"),
+    "token": ("WATSONX_TOKEN",),
+    "zen_api_key": ("WATSONX_ZENAPIKEY",),
+}
+
 PROVIDER_ROUTING_ENV_VARS = {
     "azure": {
         "api_base": ("AZURE_API_BASE", "AZURE_OPENAI_ENDPOINT"),
@@ -215,22 +224,8 @@ PROVIDER_ROUTING_ENV_VARS = {
         "vertex_project": ("VERTEXAI_PROJECT", "GOOGLE_CLOUD_PROJECT", "GCLOUD_PROJECT"),
         "vertex_location": ("VERTEXAI_LOCATION", "VERTEX_LOCATION"),
     },
-    "watsonx": {
-        "api_base": ("WATSONX_API_BASE", "WATSONX_URL", "WX_URL", "WML_URL"),
-        "project_id": ("WATSONX_PROJECT_ID", "WX_PROJECT_ID", "PROJECT_ID"),
-        "space_id": ("WATSONX_DEPLOYMENT_SPACE_ID", "WATSONX_SPACE_ID", "WX_SPACE_ID", "SPACE_ID"),
-        "region_name": ("WATSONX_REGION", "WX_REGION", "REGION"),
-        "token": ("WATSONX_TOKEN",),
-        "zen_api_key": ("WATSONX_ZENAPIKEY",),
-    },
-    "watsonx_text": {
-        "api_base": ("WATSONX_API_BASE", "WATSONX_URL", "WX_URL", "WML_URL"),
-        "project_id": ("WATSONX_PROJECT_ID", "WX_PROJECT_ID", "PROJECT_ID"),
-        "space_id": ("WATSONX_DEPLOYMENT_SPACE_ID", "WATSONX_SPACE_ID", "WX_SPACE_ID", "SPACE_ID"),
-        "region_name": ("WATSONX_REGION", "WX_REGION", "REGION"),
-        "token": ("WATSONX_TOKEN",),
-        "zen_api_key": ("WATSONX_ZENAPIKEY",),
-    },
+    "watsonx": dict(_WATSONX_ROUTING_ENV_VARS),
+    "watsonx_text": dict(_WATSONX_ROUTING_ENV_VARS),
 }
 
 # Keep aliases in the same precedence order as LiteLLM 1.100.0.
@@ -1898,6 +1893,15 @@ def _as_bool(value, default: bool) -> bool:
     return default
 
 
+def _as_list(value) -> list:
+    """Parse a config value that may arrive as an list[str] (toml) or a string (env override)."""
+    if isinstance(value, (list, tuple)):
+        return [str(v).strip() for v in value if str(v).strip()]
+    if isinstance(value, str):
+        return [v.strip() for v in value.split(",") if v.strip()]
+    return []
+
+
 def _configured_client_retries():
     """config.num_retries as a non-negative int, or None (unset/invalid = client defaults).
 
@@ -2237,12 +2241,7 @@ class LiteLLMAIHandler(BaseAiHandler):
                         provider_params.setdefault(provider, {})[parameter] = value
                         break
 
-        aws_region = (
-            os.environ.get("AWS_REGION_NAME")
-            or settings.get("aws.AWS_REGION_NAME", None)
-            or os.environ.get("AWS_REGION")
-            or os.environ.get("AWS_DEFAULT_REGION")
-        )
+        aws_region = self._resolve_aws_region(settings)
         if aws_region:
             provider_params.setdefault("bedrock", {})["aws_region_name"] = aws_region
         mantle_aws_region = aws_region
@@ -2441,6 +2440,23 @@ class LiteLLMAIHandler(BaseAiHandler):
                 provider_api_keys[provider] = api_key
         return provider_api_keys
 
+    def _captured_api_key(self, provider: str):
+        """Return the API key captured for a provider, preferring configured params over the environment."""
+        return (
+            getattr(self, "_provider_request_params", {}).get(provider, {}).get("api_key")
+            or getattr(self, "_provider_environment_api_keys", {}).get(provider)
+        )
+
+    @staticmethod
+    def _resolve_aws_region(settings) -> str | None:
+        """Resolve the AWS region from the environment and the configured aws settings."""
+        return (
+            os.environ.get("AWS_REGION_NAME")
+            or settings.get("aws.AWS_REGION_NAME", None)
+            or os.environ.get("AWS_REGION")
+            or os.environ.get("AWS_DEFAULT_REGION")
+        )
+
     @staticmethod
     def _snapshot_request_headers(settings) -> dict:
         """Capture explicitly configured headers for every request from this handler."""
@@ -2463,12 +2479,7 @@ class LiteLLMAIHandler(BaseAiHandler):
             variable: os.environ.get(variable)
             for variable in AWS_CREDENTIAL_CHAIN_ENV_VARS
         }
-        request_region = (
-            os.environ.get("AWS_REGION_NAME")
-            or settings.get("aws.AWS_REGION_NAME", None)
-            or os.environ.get("AWS_REGION")
-            or os.environ.get("AWS_DEFAULT_REGION")
-        )
+        request_region = self._resolve_aws_region(settings)
         ambient_access_key = os.environ.get("AWS_ACCESS_KEY_ID")
         ambient_secret_key = os.environ.get("AWS_SECRET_ACCESS_KEY")
         if bool(ambient_access_key) != bool(ambient_secret_key):
@@ -3406,26 +3417,6 @@ class LiteLLMAIHandler(BaseAiHandler):
         # Normalize operator-controlled config: Dynaconf/env overrides can
         # arrive as strings (AUTO_CAST_FOR_DYNACONF is disabled), so coerce
         # defensively instead of trusting the declared types.
-        def _as_list(value):
-            if isinstance(value, (list, tuple)):
-                return [str(v).strip() for v in value if str(v).strip()]
-            if isinstance(value, str):
-                return [v.strip() for v in value.split(",") if v.strip()]
-            return []
-
-        def _as_bool(value, default=True):
-            if isinstance(value, bool):
-                return value
-            if isinstance(value, str):
-                return value.strip().lower() in ("1", "true", "yes", "on")
-            return default
-
-        def _as_int(value):
-            try:
-                return int(value)
-            except (TypeError, ValueError):
-                return 0
-
         provider_only = _as_list(openrouter_settings.get("provider_only", []))
         provider_order = _as_list(openrouter_settings.get("provider_order", []))
         if provider_only:
@@ -3433,13 +3424,13 @@ class LiteLLMAIHandler(BaseAiHandler):
         elif provider_order:
             provider = extra_body.setdefault("provider", {})
             provider["order"] = provider_order
-            provider["allow_fallbacks"] = _as_bool(openrouter_settings.get("allow_fallbacks", True))
+            provider["allow_fallbacks"] = _as_bool(openrouter_settings.get("allow_fallbacks", True), default=True)
 
         reasoning = {}
         effective_reasoning_effort = str(
             openrouter_settings.get("reasoning_effort", "") or ""
         ).strip().lower()
-        reasoning_max_tokens = _as_int(openrouter_settings.get("reasoning_max_tokens", 0))
+        reasoning_max_tokens = self._coerce_token_value(openrouter_settings.get("reasoning_max_tokens", 0))
         if effective_reasoning_effort:
             try:
                 ReasoningEffort(effective_reasoning_effort)
@@ -3500,12 +3491,15 @@ class LiteLLMAIHandler(BaseAiHandler):
         if extra_body:
             kwargs["extra_body"] = extra_body
 
-        max_tokens = _as_int(openrouter_settings.get("max_tokens", 0))
+        max_tokens = self._coerce_token_value(openrouter_settings.get("max_tokens", 0))
+        output_limit_param = (
+            "max_completion_tokens" if "max_completion_tokens" in kwargs else "max_tokens"
+        )
         if max_tokens > 0:
-            existing = _as_int(kwargs.get("max_tokens", 0))
-            kwargs["max_tokens"] = min(existing, max_tokens) if existing > 0 else max_tokens
-        effective_max_tokens = _as_int(kwargs.get("max_tokens", 0))
-        effective_reasoning_max_tokens = _as_int(reasoning.get("max_tokens", 0))
+            existing = self._coerce_token_value(kwargs.get(output_limit_param, 0))
+            kwargs[output_limit_param] = min(existing, max_tokens) if existing > 0 else max_tokens
+        effective_max_tokens = self._coerce_token_value(kwargs.get(output_limit_param, 0))
+        effective_reasoning_max_tokens = self._coerce_token_value(reasoning.get("max_tokens", 0))
         effective_reasoning_effort = reasoning.get("effort")
         if (
             model.startswith("openrouter/anthropic/")
@@ -3522,6 +3516,118 @@ class LiteLLMAIHandler(BaseAiHandler):
             )
         return kwargs
 
+    @staticmethod
+    def _coerce_token_value(value) -> int:
+        """Mirror the request's permissive integer coercion without conversion failures."""
+        try:
+            return int(value)
+        except (TypeError, ValueError, OverflowError):
+            return 0
+
+    def _claude_thinking_mode(self, model: str) -> str | None:
+        """Return the thinking mode selected by request construction for this model."""
+        adaptive_model = self._is_claude_adaptive_thinking_model(model)
+        if adaptive_model and self._claude_thinking_controls["enable_claude_adaptive_thinking"]:
+            return "adaptive"
+        if (
+            model in self.claude_extended_thinking_models
+            and self._claude_thinking_controls["enable_claude_extended_thinking"]
+        ):
+            return "unsupported_extended" if adaptive_model else "extended"
+        return None
+
+    def _get_claude_extended_thinking_limits(self) -> tuple[int, int]:
+        """Validate and return the snapshotted extended-thinking budget and output cap."""
+        extended_thinking_budget_tokens = self._claude_thinking_controls["extended_thinking_budget_tokens"]
+        extended_thinking_max_output_tokens = self._claude_thinking_controls["extended_thinking_max_output_tokens"]
+
+        if not isinstance(extended_thinking_budget_tokens, int) or extended_thinking_budget_tokens <= 0:
+            raise ValueError(
+                f"extended_thinking_budget_tokens must be a positive integer, "
+                f"got {extended_thinking_budget_tokens}"
+            )
+        if not isinstance(extended_thinking_max_output_tokens, int) or extended_thinking_max_output_tokens <= 0:
+            raise ValueError(
+                f"extended_thinking_max_output_tokens must be a positive integer, "
+                f"got {extended_thinking_max_output_tokens}"
+            )
+        if extended_thinking_max_output_tokens < extended_thinking_budget_tokens:
+            raise ValueError(
+                f"extended_thinking_max_output_tokens ({extended_thinking_max_output_tokens}) must be greater than "
+                f"or equal to extended_thinking_budget_tokens ({extended_thinking_budget_tokens})"
+            )
+        return extended_thinking_budget_tokens, extended_thinking_max_output_tokens
+
+    def _resolve_output_token_limit(self, model: str, openrouter_model: str | None) -> int:
+        """Return the final positive output cap selected by PR-Agent request controls."""
+        output_tokens = self._coerce_token_value(get_settings().config.get("max_output_tokens", 0))
+        if self._claude_thinking_mode(model) == "extended":
+            _, output_tokens = self._get_claude_extended_thinking_limits()
+
+        if openrouter_model:
+            openrouter_output_tokens = self._coerce_token_value(self._openrouter_controls.get("max_tokens", 0))
+            if openrouter_output_tokens > 0:
+                output_tokens = (
+                    min(output_tokens, openrouter_output_tokens)
+                    if output_tokens > 0
+                    else openrouter_output_tokens
+                )
+        return output_tokens if output_tokens > 0 else 0
+
+    def get_output_token_limit(self, model: str) -> int:
+        """Return the output cap that this handler will request for the supplied model."""
+        custom_llm_provider = self._custom_llm_provider
+        configured_deployment_id = self.deployment_id
+        routed_model = self._route_model_for_request(model, custom_llm_provider, configured_deployment_id)
+        completion_model = self._normalize_gpt5_model_for_request(routed_model, model, custom_llm_provider)
+        request_provider = (
+            PROVIDER_SETTING_ALIASES.get(custom_llm_provider, custom_llm_provider)
+            if custom_llm_provider
+            else self._resolve_request_provider(routed_model)
+        )
+        openrouter_model = self._canonical_openrouter_model(completion_model, request_provider)
+        return self._resolve_output_token_limit(completion_model, openrouter_model)
+
+    def get_output_token_reserve(self, model: str, default_output_tokens: int) -> int:
+        """Return completion headroom to reserve while fitting a request prompt."""
+        output_tokens = self.get_output_token_limit(model)
+        if output_tokens > 0:
+            return output_tokens
+
+        default_output_tokens = self._coerce_token_value(default_output_tokens)
+        custom_llm_provider = self._custom_llm_provider
+        routed_model = self._route_model_for_request(model, custom_llm_provider, self.deployment_id)
+        request_provider = (
+            PROVIDER_SETTING_ALIASES.get(custom_llm_provider, custom_llm_provider)
+            if custom_llm_provider
+            else self._resolve_request_provider(routed_model)
+        )
+        openrouter_model = self._canonical_openrouter_model(
+            routed_model, request_provider
+        )
+        if not openrouter_model:
+            return default_output_tokens
+
+        reasoning_effort = str(
+            self._openrouter_controls.get("reasoning_effort", "") or ""
+        ).strip().lower()
+        reasoning_effort = self._clamp_grok_reasoning_effort(
+            openrouter_model, reasoning_effort
+        )
+        reasoning_tokens = self._coerce_token_value(
+            self._openrouter_controls.get("reasoning_max_tokens", 0)
+        )
+        if reasoning_effort == "none" or reasoning_tokens <= 0:
+            return default_output_tokens
+        return default_output_tokens + reasoning_tokens
+
+    @staticmethod
+    def normalize_request_prompts(model: str, system_prompt: str, user_prompt: str) -> tuple[str, str]:
+        """Return the prompt strings that request construction will send."""
+        if 'claude' in model and not system_prompt:
+            system_prompt = "No system prompt provided"
+        return system_prompt, user_prompt
+
     def _configure_claude_extended_thinking(self, model: str, kwargs: dict) -> dict:
         """
         Configure Claude extended thinking parameters if applicable.
@@ -3533,16 +3639,9 @@ class LiteLLMAIHandler(BaseAiHandler):
         Returns:
             dict: Updated kwargs with extended thinking configuration
         """
-        extended_thinking_budget_tokens = self._claude_thinking_controls["extended_thinking_budget_tokens"]
-        extended_thinking_max_output_tokens = self._claude_thinking_controls["extended_thinking_max_output_tokens"]
-
-        # Validate extended thinking parameters
-        if not isinstance(extended_thinking_budget_tokens, int) or extended_thinking_budget_tokens <= 0:
-            raise ValueError(f"extended_thinking_budget_tokens must be a positive integer, got {extended_thinking_budget_tokens}")
-        if not isinstance(extended_thinking_max_output_tokens, int) or extended_thinking_max_output_tokens <= 0:
-            raise ValueError(f"extended_thinking_max_output_tokens must be a positive integer, got {extended_thinking_max_output_tokens}")
-        if extended_thinking_max_output_tokens < extended_thinking_budget_tokens:
-            raise ValueError(f"extended_thinking_max_output_tokens ({extended_thinking_max_output_tokens}) must be greater than or equal to extended_thinking_budget_tokens ({extended_thinking_budget_tokens})")
+        extended_thinking_budget_tokens, extended_thinking_max_output_tokens = (
+            self._get_claude_extended_thinking_limits()
+        )
 
         kwargs["thinking"] = {
             "type": "enabled",
@@ -3808,10 +3907,11 @@ class LiteLLMAIHandler(BaseAiHandler):
                 # prefixes must remain intact in multi-provider configurations.
                 model = completion_model
                 openrouter_model = self._canonical_openrouter_model(model, request_provider)
-                if 'claude' in model and not system:
-                    system = "No system prompt provided"
+                normalized_system, user = self.normalize_request_prompts(model, system, user)
+                if normalized_system != system:
                     get_logger().warning(
                         "Empty system prompt for claude model. Adding a newline character to prevent OpenAI API error.")
+                system = normalized_system
                 messages = [{"role": "system", "content": system}, {"role": "user", "content": user}]
 
                 if img_path:
@@ -3870,7 +3970,12 @@ class LiteLLMAIHandler(BaseAiHandler):
                     user = f"{system}\n\n\n{user}"
                     system = ""
                     get_logger().info(f"Using model {model}, combining system and user prompts")
-                    messages = [{"role": "user", "content": user}]
+                    if img_path:
+                        content = [{"type": "text", "text": user},
+                                   {"type": "image_url", "image_url": {"url": img_path}}]
+                    else:
+                        content = user
+                    messages = [{"role": "user", "content": content}]
 
                 # Build request kwargs after normalizing the model and messages so credentials and
                 # endpoints can be selected for the provider that will actually receive this call.
@@ -3957,19 +4062,16 @@ class LiteLLMAIHandler(BaseAiHandler):
                 # https://docs.anthropic.com/en/docs/build-with-claude/extended-thinking
                 adaptive_thinking_enabled = self._claude_thinking_controls["enable_claude_adaptive_thinking"]
                 extended_thinking_enabled = self._claude_thinking_controls["enable_claude_extended_thinking"]
-                if self._is_claude_adaptive_thinking_model(model) and adaptive_thinking_enabled:
+                claude_thinking_mode = self._claude_thinking_mode(model)
+                if claude_thinking_mode == "adaptive":
                     kwargs = self._configure_claude_adaptive_thinking(model, kwargs)
-                elif (
-                    model in self.claude_extended_thinking_models
-                    and extended_thinking_enabled
-                ):
-                    if self._is_claude_adaptive_thinking_model(model):
-                        get_logger().warning(
-                            f"Skipping extended thinking for {model}: adaptive-only models reject "
-                            f"budget_tokens. Enable config.enable_claude_adaptive_thinking instead."
-                        )
-                    else:
-                        kwargs = self._configure_claude_extended_thinking(model, kwargs)
+                elif claude_thinking_mode == "extended":
+                    kwargs = self._configure_claude_extended_thinking(model, kwargs)
+                elif claude_thinking_mode == "unsupported_extended":
+                    get_logger().warning(
+                        f"Skipping extended thinking for {model}: adaptive-only models reject "
+                        f"budget_tokens. Enable config.enable_claude_adaptive_thinking instead."
+                    )
                 elif adaptive_thinking_enabled or extended_thinking_enabled:
                     message = (
                         f"No thinking configuration applied for model {model}: adaptive thinking "
@@ -3987,10 +4089,7 @@ class LiteLLMAIHandler(BaseAiHandler):
                 # providers apply a low service-side default (Bedrock Converse: 4096,
                 # which reasoning can fully consume, returning empty content).
                 # setdefault keeps the extended-thinking limit authoritative.
-                try:
-                    max_output_tokens = int(get_settings().config.get("max_output_tokens", 0))
-                except (TypeError, ValueError):
-                    max_output_tokens = 0
+                max_output_tokens = self._resolve_output_token_limit(model, openrouter_model)
                 if max_output_tokens > 0:
                     output_limit_param = "max_completion_tokens" if is_gpt6_astra else "max_tokens"
                     kwargs.setdefault(output_limit_param, max_output_tokens)
@@ -4257,10 +4356,7 @@ class LiteLLMAIHandler(BaseAiHandler):
             and _request_local_openai_headers(transport, model=transport_model) is not None
         )
         if provider == "azure" and azure_ad_token and kwargs.get("api_key") is not None:
-            captured_key = (
-                self._provider_request_params.get("azure", {}).get("api_key")
-                or self._provider_environment_api_keys.get("azure")
-            )
+            captured_key = self._captured_api_key("azure")
             model = kwargs.get("model", "")
             headers = dict(kwargs.get("headers") or {})
             guard_key = kwargs.get("api_key") == DUMMY_LITELLM_API_KEY and (self._azure_ad or not captured_key)
@@ -4337,20 +4433,14 @@ class LiteLLMAIHandler(BaseAiHandler):
             vertex_aws_token = _vertex_request_aws_environment.set(self._vertex_aws_environment)
             vertex_default_token = _vertex_request_default_adc.set(adc_snapshot)
         if provider == "databricks":
-            captured_key = (
-                getattr(self, "_provider_request_params", {}).get("databricks", {}).get("api_key")
-                or getattr(self, "_provider_environment_api_keys", {}).get("databricks")
-            )
+            captured_key = self._captured_api_key("databricks")
             keyless = kwargs.get("api_key") == DUMMY_LITELLM_API_KEY and not captured_key
             if keyless:
                 _install_databricks_keyless_bridge()
             databricks_token = _databricks_request_keyless.set(keyless)
         if provider == "anthropic":
             _install_anthropic_auth_token_bridge()
-            captured_key = (
-                getattr(self, "_provider_request_params", {}).get("anthropic", {}).get("api_key")
-                or getattr(self, "_provider_environment_api_keys", {}).get("anthropic")
-            )
+            captured_key = self._captured_api_key("anthropic")
             anthropic_token = _anthropic_request_auth_token.set({
                 "auth_token": getattr(self, "_anthropic_auth_token", None),
                 "generated_guard": kwargs.get("api_key") == DUMMY_LITELLM_API_KEY and not captured_key,

@@ -1,4 +1,5 @@
 import difflib
+import posixpath
 import re
 import urllib.parse
 from datetime import datetime, timezone
@@ -143,6 +144,11 @@ class _GitLabIncrementalNote:
         self.anchor_time = max(candidates) if candidates else None
         self.html_url = f"{mr_web_url}#note_{self.id}" if mr_web_url else ""
 
+# GitLab project access levels: No access = 0, Minimal Access = 5, Guest = 10,
+# Reporter = 20, Developer = 30, Maintainer = 40, Owner = 50. Reading a private or
+# internal project's repository source requires at least Reporter-level access.
+_GITLAB_ACCESS_LEVEL_REPORTER = 20
+
 class GitLabProvider(GitProvider):
 
     def __init__(self, merge_request_url: Optional[str] = None, incremental: Optional[bool] = False):
@@ -197,20 +203,38 @@ class GitLabProvider(GitProvider):
     def _get_gitmodules_map(self) -> dict[str, str]:
         """
         Return {submodule_path -> repo_url} from '.gitmodules' (best effort).
-        Tries target branch first, then source branch. Always returns text.
+        Reads the MR head commit first (it carries the submodule URLs the MR introduces, e.g. after a
+        submodule was moved), then falls back to the source branch, the MR base commit and the target
+        branch. Always returns text.
         """
         try:
             proj = self.gl.projects.get(self.id_project)
         except Exception:
             return {}
 
+        diff_refs = getattr(self.mr, "diff_refs", None)
+        diff_refs = diff_refs if isinstance(diff_refs, dict) else {}
+
+        def _source_project():
+            # For fork MRs the source branch lives in the source project, not the target project. If that
+            # project cannot be fetched, skip the source read rather than looking the fork's branch name up
+            # in the target project, where a same-named branch would yield unrelated '.gitmodules' content.
+            source_project_id = getattr(self.mr, "source_project_id", None)
+            if not source_project_id or str(source_project_id) == str(getattr(proj, "id", None)):
+                return proj
+            try:
+                return self.gl.projects.get(source_project_id)
+            except Exception as e:
+                get_logger().warning(f"[submodule] cannot fetch source project '{source_project_id}': {e}")
+                return None
+
         import base64
 
-        def _read_text(ref: str | None) -> str | None:
-            if not ref:
+        def _read_text(project, ref: str | None) -> str | None:
+            if project is None or not ref:
                 return None
             try:
-                f = proj.files.get(file_path=".gitmodules", ref=ref)
+                f = project.files.get(file_path=".gitmodules", ref=ref)
             except Exception:
                 return None
 
@@ -234,9 +258,13 @@ class GitLabProvider(GitProvider):
 
             return None
 
+        # The MR head SHA is immutable (unlike the branch, which may be force-pushed meanwhile) and is
+        # reachable in the target project also for fork MRs (refs/merge-requests/<iid>/head).
         content = (
-            _read_text(getattr(self.mr, "target_branch", None))
-            or _read_text(getattr(self.mr, "source_branch", None))
+            _read_text(proj, diff_refs.get("head_sha"))
+            or _read_text(_source_project(), getattr(self.mr, "source_branch", None))
+            or _read_text(proj, diff_refs.get("base_sha"))
+            or _read_text(proj, getattr(self.mr, "target_branch", None))
         )
         if not content:
             return {}
@@ -266,12 +294,35 @@ class GitLabProvider(GitProvider):
                 out[path] = url
         return out
 
-    def _url_to_project_path(self, url: str) -> str | None:
+    def _superproject_path(self) -> str | None:
         """
-        Convert ssh/https GitLab URL to 'group/subgroup/repo' project path.
+        Return the MR project's 'group/subgroup/.../repo' path, used as the base for relative submodule URLs.
+        """
+        id_project = str(self.id_project or "")
+        if "/" in id_project:
+            return id_project
+        try:
+            return getattr(self.gl.projects.get(self.id_project), "path_with_namespace", None) or None
+        except Exception as e:
+            get_logger().warning(f"[submodule] cannot look up project path for project '{id_project}': {e}")
+            return None
+
+    def _url_to_project_path(self, url: str, base_project_path: str | None = None) -> str | None:
+        """
+        Convert ssh/https GitLab URL to a 'group/subgroup/.../repo' project path (any nesting depth).
+
+        Relative URLs ('../group/repo.git', './repo.git') are resolved the way git does: against the
+        superproject's own URL, so '../' first steps out of the superproject repository itself.
         """
         try:
-            if url.startswith("git@") and ":" in url:
+            if url.startswith(("./", "../")):
+                if not base_project_path:
+                    return None
+                rel_path = urllib.parse.urlparse(url).path
+                path = posixpath.normpath(posixpath.join(base_project_path.strip("/"), rel_path))
+                if path in (".", "..") or path.startswith("../"):
+                    return None
+            elif url.startswith("git@") and ":" in url:
                 path = url.split(":", 1)[1]
             else:
                 path = urllib.parse.urlparse(url).path.lstrip("/")
@@ -363,6 +414,7 @@ class GitLabProvider(GitProvider):
             return changes
 
         out = list(changes)
+        base_project_path = None
         for ch in changes:
             patch = ch.get("diff") or ""
             if "Subproject commit" not in patch:
@@ -381,7 +433,11 @@ class GitLabProvider(GitProvider):
                 get_logger().warning(f"[submodule] no url for '{sub_path}' in .gitmodules (skip)")
                 continue
 
-            proj_path = self._url_to_project_path(repo_url)
+            if repo_url.startswith(("./", "../")) and base_project_path is None:
+                base_project_path = self._superproject_path() or ""
+                if not base_project_path:
+                    get_logger().warning("[submodule] superproject path unknown; relative submodule urls are skipped")
+            proj_path = self._url_to_project_path(repo_url, base_project_path)
             if not proj_path:
                 get_logger().warning(f"[submodule] cannot parse project path from url '{repo_url}' (skip)")
                 continue
@@ -457,7 +513,7 @@ class GitLabProvider(GitProvider):
         if not repo_git_url: #Use PR url as context
             try:
                 desired_branch = self.gl.projects.get(self.id_project).default_branch
-            except Exception as e:
+            except Exception:
                 get_logger().exception(f"Cannot get PR: {self.pr_url} default branch. Tried project ID: {self.id_project}")
                 return ("", "")
             # numeric-alias URLs need the "projects/" segment, same as get_line_link
@@ -822,7 +878,7 @@ class GitLabProvider(GitProvider):
                     'original_files': names_original,
                     'filtered_files': names_filtered
                 })
-            except Exception as e:
+            except Exception:
                 pass
 
         diff_files = []
@@ -890,6 +946,18 @@ class GitLabProvider(GitProvider):
             raw_changes = self._expand_submodule_changes(raw_changes)
             self.git_files = [c.get('new_path') for c in raw_changes if c.get('new_path')]
         return self.git_files
+
+    def get_pr_file_paths(self) -> list:
+        """Return the complete MR file set regardless of incremental review state.
+
+        get_files() returns only the unreviewed subset once an incremental review
+        is active, so per-directory settings would change between commands based on
+        which files the review already covered. Discovery instead walks the full MR
+        changes, keeping both old_path and new_path so both sides of a rename apply.
+        """
+        raw_changes = self._get_merge_request_changes().get('changes', [])
+        raw_changes = self._expand_submodule_changes(raw_changes)
+        return [c for c in raw_changes if c.get('new_path') or c.get('old_path')]
 
     def publish_description(self, pr_title: str, pr_body: str) -> None:
         try:
@@ -1144,7 +1212,7 @@ class GitLabProvider(GitProvider):
                 store.add(body_fp)
                 store.add(code_fp)
             return True
-        except Exception as e:
+        except Exception:
             try:
                 # fallback - create a general note on the file in the MR
                 if 'suggestion_orig_location' in original_suggestion:
@@ -1167,10 +1235,6 @@ class GitLabProvider(GitProvider):
                     label = original_suggestion['label']
                     score = original_suggestion.get('score', 7)
 
-                if hasattr(self, 'main_language'):
-                    language = self.main_language
-                else:
-                    language = ''
                 link = self.get_line_link(relevant_file, line_start, line_end)
                 body_fallback =f"**Suggestion:** {content} [{label}, importance: {score}]\n\n"
                 body_fallback +=f"\n\n<details><summary>[{target_file.filename} [{line_start}-{line_end}]]({link}):</summary>\n\n"
@@ -1204,7 +1268,7 @@ class GitLabProvider(GitProvider):
                     store.add(code_fp)
                 return True
 
-            except Exception as e:
+            except Exception:
                 get_logger().exception(f"Failed to create comment in MR {self.id_mr}")
                 return False
 
@@ -1387,18 +1451,20 @@ class GitLabProvider(GitProvider):
     def get_pr_branch(self):
         return self.mr.source_branch
 
-    def get_owning_namespace(self) -> str | None:
+    def get_owning_namespace(self, *, resolved: bool = False) -> str | None:
         # The top-level group of the project's path_with_namespace works on any host
-        # (gitlab.com or self-hosted) with no extra round trip: numeric project IDs are
-        # resolved to their canonical path first so the group name is still available.
+        # (gitlab.com or self-hosted). Resolve numeric IDs, and all identifiers when
+        # checking sibling access, to the canonical path before comparing groups.
         if not getattr(self, "gl", None) or not getattr(self, "id_project", None):
             return None
         project_id = str(self.id_project)
-        if project_id.isascii() and project_id.isdigit():
+        if resolved or (project_id.isascii() and project_id.isdigit()):
             try:
                 project_path = self.gl.projects.get(project_id).path_with_namespace
             except Exception as e:
                 get_logger().warning(f"Failed to resolve canonical GitLab project path, error: {e}")
+                if resolved:
+                    raise
                 return None
             if not project_path:
                 return None
@@ -1430,6 +1496,63 @@ class GitLabProvider(GitProvider):
             get_logger().warning(f"Failed to load local .pr_agent.toml file, error: {e}")
         return settings_files if settings_files else ""
 
+    def get_repo_settings_tree(self, ref: str = "") -> tuple[list[str], str]:
+        """Recursively list every `.pr_agent.toml` at the repository default branch.
+
+        GitLab root config is always read from the project default branch; the
+        per-directory layer follows the same branch so nested configs cannot read
+        a branch that the root does not use.  ``ref`` is accepted for interface
+        compatibility but ignored — a future follow-up could add CONFIG_BRANCH
+        support here.
+        """
+        if not getattr(self, "gl", None) or not getattr(self, "id_project", None):
+            return [], ""
+        try:
+            project = self.gl.projects.get(self.id_project)
+            resolved_ref = project.default_branch
+            max_pages = get_settings().config.per_directory_settings_max_tree_pages
+            if isinstance(max_pages, bool) or not isinstance(max_pages, int) or max_pages < 1:
+                get_logger().warning("Invalid per-directory tree page limit; skipping nested settings")
+                return [], resolved_ref
+            paths = []
+            for page in range(1, max_pages + 1):
+                tree = project.repository_tree(ref=resolved_ref, recursive=True, page=page, per_page=100)
+                paths.extend(
+                    item["path"] for item in tree
+                    if item.get("type") == "blob"
+                    and (item.get("path") or "").split("/")[-1] == ".pr_agent.toml"
+                )
+                if len(tree) < 100:
+                    return paths, resolved_ref
+            get_logger().warning("Per-directory tree page limit reached; skipping incomplete nested settings discovery")
+            return [], resolved_ref
+        except GitlabGetError as e:
+            if getattr(e, "response_code", None) == 404:
+                get_logger().debug("No repository tree found for per-directory settings; skipping")
+                return [], ""
+            raise
+
+    def get_repo_settings_contents(self, paths: list[str], ref: str) -> dict[str, bytes]:
+        """Fetch raw content of per-directory settings files at *ref*."""
+        if not getattr(self, "gl", None) or not getattr(self, "id_project", None):
+            return {}
+        project = self.gl.projects.get(self.id_project)
+        result: dict[str, bytes] = {}
+        for path in paths:
+            try:
+                content = project.files.get(file_path=path, ref=ref).decode()
+                if isinstance(content, str):
+                    content = content.encode("utf-8")
+                result[path] = content
+            except GitlabGetError as e:
+                if getattr(e, "response_code", None) == 404:
+                    get_logger().warning(
+                        f"Per-directory settings file '{path}' not found at ref '{ref}'; skipping"
+                    )
+                else:
+                    raise
+        return result
+
     def _get_global_settings_cache_key(self, group: str) -> str:
         return f"gitlab:{getattr(self, 'gitlab_url', '')}:{group}"
 
@@ -1460,6 +1583,92 @@ class GitLabProvider(GitProvider):
             if getattr(e, "response_code", None) == 404:
                 return ""
             raise
+
+    def get_sibling_repo_file_content(self, repo_id: str, file_path: str, from_default_branch: bool = False):
+        try:
+            repo_id = (repo_id or "").strip().strip("/")
+            file_path = (file_path or "").strip().lstrip("/")
+            if not repo_id or not file_path:
+                return ""
+            if not self.is_sibling_repo_allowed(repo_id):
+                get_logger().warning(f"Ignoring sibling repo absent from the host allowlist: {repo_id}")
+                return ""
+            project = self.gl.projects.get(repo_id)
+            resolved_path = project.path_with_namespace
+            current_namespace = self.get_owning_namespace(resolved=True)
+            numeric_id = repo_id.isascii() and repo_id.isdigit()
+            identity_matches = str(project.id) == repo_id if numeric_id else resolved_path == repo_id
+            if (not isinstance(resolved_path, str) or "/" not in resolved_path or not identity_matches
+                    or not current_namespace or resolved_path.split("/")[0] != current_namespace):
+                get_logger().warning(f"Ignoring out-of-namespace sibling repo in repo context: {repo_id}")
+                return ""
+            if not self._requester_can_read_sibling_project(project):
+                get_logger().warning(
+                    f"Ignoring sibling repo context file the review requester cannot read: {repo_id}"
+                )
+                return ""
+            contents = project.files.get(file_path=file_path, ref=project.default_branch).decode()
+            return decode_if_bytes(contents)
+        except GitlabGetError as e:
+            # A missing optional file is expected, but transient/provider failures must reach
+            # repo_context so the failed result is not cached as a successful empty context.
+            if getattr(e, "response_code", None) == 404:
+                return ""
+            raise
+
+    def _get_review_requester_id(self) -> Optional[int]:
+        # Prefer the authenticated command actor when one is known: comment commands can pass
+        # arbitrary arguments, so sibling context must be authorized against whoever actually
+        # issued the command, not the MR author. Fall back to the MR author only when no actor
+        # is recorded (CLI runs), and fail closed without either identity.
+        requester_id = getattr(self, "_command_actor", None)
+        if requester_id:
+            return requester_id
+        mr = getattr(self, "mr", None)
+        author = getattr(mr, "author", None) if mr is not None else None
+        if isinstance(author, dict):
+            return author.get("id")
+        if author is not None:
+            return getattr(author, "id", None)
+        return None
+
+    def _requester_can_read_sibling_project(self, project) -> bool:
+        # Public projects are readable by any instance user, including external users.
+        visibility = getattr(project, "visibility", None)
+        if visibility == "public":
+            return True
+        requester_id = self._get_review_requester_id()
+        if not requester_id:
+            return False
+        if visibility == "internal":
+            # Internal projects are visible to every signed-in instance user who is not an
+            # external user; membership is not required. Only a positive "external" verdict
+            # rejects here; an unknown flag falls through to the membership check and fails
+            # closed, since external users cannot be granted internal access as members either.
+            try:
+                user = self.gl.users.get(requester_id)
+            except GitlabGetError as e:
+                # A definitive 404 (no such user) means denial; provider/network failures are
+                # not a verdict and must surface as a fetch error instead of a silent skip.
+                if getattr(e, "response_code", None) == 404:
+                    return False
+                raise
+            if getattr(user, "external", None) is False:
+                return True
+        try:
+            member = project.members_all.get(requester_id)
+        except GitlabGetError as e:
+            # A definitive 404 (not a member) means denial; auth/provider failures are not a
+            # verdict and must surface as a fetch error instead of silently dropping the file.
+            if getattr(e, "response_code", None) == 404:
+                return False
+            raise
+        access_level = getattr(member, "access_level", None)
+        # Reading repository source code requires at least Reporter-level access; Guests,
+        # minimal-access members, and unknown levels are rejected. Requiring positive membership
+        # with that level also fails closed for external users, whom GitLab forbids from
+        # internal projects, and for low-access members of private projects.
+        return isinstance(access_level, int) and access_level >= _GITLAB_ACCESS_LEVEL_REPORTER
 
     def get_repo_context_ref(self, from_default_branch: bool = False) -> Optional[str]:
         # The MR target branch (the branch being merged into) is the cached revision; the

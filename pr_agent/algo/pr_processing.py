@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import traceback
+from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Callable, List, Tuple
 
@@ -28,6 +29,15 @@ ADDED_FILES_ = "Additional added files (insufficient token budget to process):\n
 OUTPUT_BUFFER_TOKENS_SOFT_THRESHOLD = 1500
 OUTPUT_BUFFER_TOKENS_HARD_THRESHOLD = 1000
 MAX_EXTRA_LINES = 10
+
+_effective_fallback_chain: ContextVar[tuple[tuple[str, str | None], ...] | None] = ContextVar(
+    "pr_agent_effective_fallback_chain", default=None
+)
+
+
+def get_effective_fallback_chain() -> tuple[tuple[str, str | None], ...] | None:
+    """Return the model/deployment chain selected for the current retry invocation."""
+    return _effective_fallback_chain.get()
 
 
 @dataclass
@@ -83,7 +93,7 @@ def get_pr_diff(git_provider: GitProvider, token_handler: TokenHandler,
     if pr_languages:
         try:
             get_logger().info(f"PR main language: {pr_languages[0]['language']}")
-        except Exception as e:
+        except Exception:
             pass
 
     # generate a standard diff string, with patch extension
@@ -193,7 +203,7 @@ def get_pr_diff_multiple_patchs(git_provider: GitProvider, token_handler: TokenH
     if pr_languages:
         try:
             get_logger().info(f"PR main language: {pr_languages[0]['language']}")
-        except Exception as e:
+        except Exception:
             pass
 
     patches_compressed_list, total_tokens_list, deleted_files_list, remaining_files_list, file_dict, files_in_patches_list = \
@@ -430,7 +440,6 @@ def generate_full_patch(convert_hunks_to_line_numbers, file_dict, max_tokens_mod
             continue
 
         patch = data['patch']
-        edit_type = data['edit_type']
 
         # Hard Stop, no more tokens
         if total_tokens > max_tokens_model - OUTPUT_BUFFER_TOKENS_HARD_THRESHOLD:
@@ -475,10 +484,14 @@ async def retry_with_fallback_models(f: Callable, model_type: ModelType = ModelT
     if routed:
         # A cheaper primary for a small pull request; config.fallback_models still follow it.
         all_models[0], all_deployments[0] = routed
+    # Ignore surplus deployment entries when fewer fallback models are configured; this matches
+    # the existing retry loop, which stops as soon as the first successful model returns.
+    effective_chain = tuple(zip(all_models, all_deployments[:len(all_models)], strict=True))
     original_deployment_id = get_settings().get("openai.deployment_id", None)
+    context_token = _effective_fallback_chain.set(effective_chain)
     try:
         # try each (model, deployment_id) pair until one is successful, otherwise raise exception
-        for i, (model, deployment_id) in enumerate(zip(all_models, all_deployments, strict=True)):
+        for i, (model, deployment_id) in enumerate(effective_chain):
             try:
                 get_logger().debug(
                     f"Generating prediction with {model}"
@@ -497,6 +510,7 @@ async def retry_with_fallback_models(f: Callable, model_type: ModelType = ModelT
                 record_model_used(model, is_fallback=i > 0)
                 return result
     finally:
+        _effective_fallback_chain.reset(context_token)
         get_settings().set("openai.deployment_id", original_deployment_id)
 
 

@@ -6,6 +6,7 @@ from functools import partial
 from typing import List, Optional, Tuple
 
 from jinja2 import Environment, StrictUndefined
+from pydantic import ValidationError
 
 from pr_agent.algo.ai_handlers.base_ai_handler import BaseAiHandler
 from pr_agent.algo.ai_handlers.litellm_ai_handler import LiteLLMAIHandler
@@ -17,6 +18,7 @@ from pr_agent.algo.inline_comment_dedup import (
     key_issue_fingerprint,
     key_issue_location_fingerprint,
 )
+from pr_agent.algo.output_models import PRReview
 from pr_agent.algo.pr_processing import (
     PreparedPRDiff,
     add_ai_metadata_to_diff_files,
@@ -753,6 +755,12 @@ class PRReviewer:
         return get_settings().pr_reviewer.get('publish_output_no_suggestions', True) or "No major issues detected" not in pr_review
 
     async def _prepare_prediction(self, model: str) -> None:
+        # Each model attempt owns a fresh result. A malformed primary must not
+        # leave state that can be mistaken for a successful fallback response.
+        self.prediction = None
+        self.prediction_data = None
+        self.review_chunk_count = 1
+        self.review_failed_chunk_count = 0
         raw_prompt_vars = getattr(self, "_raw_prompt_vars", getattr(self, "vars", None))
         if raw_prompt_vars is not None:
             self.vars, self.token_handler = fit_related_tickets_to_prompt_budget(
@@ -788,7 +796,9 @@ class PRReviewer:
 
         if self.patches_diff:
             get_logger().debug("PR diff", diff=self.patches_diff)
-            self.prediction = await self._get_prediction(model)
+            prediction = await self._get_prediction(model)
+            self._load_valid_review_yaml(prediction)
+            self.prediction = prediction
         else:
             get_logger().warning(f"Empty diff for PR: {self.pr_url}")
             self.prediction = None
@@ -830,19 +840,13 @@ class PRReviewer:
                 continue
             if isinstance(prediction, BaseException):
                 raise prediction
-            data = self._load_review_yaml(prediction)
-            if not isinstance(data, dict) or not isinstance(data.get("review"), dict) or not data["review"]:
-                get_logger().warning(f"Failed to parse the review of chunk {chunk_index + 1}",
-                                     artifact={"data": data})
-                continue
+            data = self._load_valid_review_yaml(prediction, source=f"review chunk {chunk_index + 1}")
+            self._validate_review_schema(data)
             raw_predictions.append(prediction)
             chunk_outputs.append(data)
 
         if not chunk_outputs:
-            if chunk_errors:
-                raise chunk_errors[0]
-            get_logger().warning("No chunk produced a parsable review, falling back to a single review call")
-            return False
+            raise chunk_errors[0]
 
         # the raw text is kept for logging only; the merged verdict is in self.prediction_data
         self.prediction = "\n".join(raw_predictions)
@@ -886,7 +890,58 @@ class PRReviewer:
                          keys_fix_yaml=["ticket_compliance_check", "estimated_effort_to_review_[1-5]:", "risk_level:",
                                         "merge_recommendation:", "security_concerns:", "key_issues_to_review:",
                                         "relevant_file:", "relevant_line:", "suggestion:"],
-                         first_key='review', last_key='security_concerns')
+                        first_key='review', last_key='security_concerns')
+
+    def _validate_review_schema(self, data: object) -> bool:
+        try:
+            PRReview.model_validate(data)
+        except ValidationError as error:
+            first_error = error.errors()[0]
+            field_path = ".".join(str(part) for part in first_error.get("loc", ())) or "$"
+            value = None if first_error.get("type") == "missing" else first_error.get("input")
+            get_logger().warning(
+                "Review output failed schema validation",
+                artifact={
+                    "field": field_path,
+                    "value": value,
+                },
+            )
+            return False
+
+        if isinstance(data, dict) and isinstance(data.get("review"), dict):
+            review = data["review"]
+            required_fields = (
+                ("ticket_compliance_check", "related_tickets"),
+                ("estimated_effort_to_review_[1-5]", "require_estimate_effort_to_review"),
+                ("risk_level", "require_risk_assessment"),
+                ("merge_recommendation", "require_merge_recommendation"),
+                ("review_priority_files", "require_priority_files"),
+                ("contribution_time_cost_estimate", "require_estimate_contribution_time_cost"),
+                ("score", "require_score"),
+                ("relevant_tests", "require_tests"),
+                ("insights_from_user_answers", "question_str"),
+                ("security_concerns", "require_security_review"),
+                ("todo_sections", "require_todo_scan"),
+                ("can_be_split", "require_can_be_split_review"),
+            )
+            vars_ = getattr(self, "vars", {})
+            for field_name, setting_name in required_fields:
+                if not vars_.get(setting_name) or field_name in review and review[field_name] is not None:
+                    continue
+                get_logger().warning(
+                    "Review output failed schema validation",
+                    artifact={"field": f"review.{field_name}", "value": None},
+                )
+                return False
+        return True
+
+    @classmethod
+    def _load_valid_review_yaml(cls, prediction: str, *, source: str = "model response") -> dict:
+        """Parse one prediction and require the minimum publishable review shape."""
+        data = cls._load_review_yaml(prediction)
+        if not isinstance(data, dict) or not isinstance(data.get("review"), dict) or not data["review"]:
+            raise ValueError(f"{source} did not contain a non-empty review mapping")
+        return data
 
     def _prepare_pr_review(self) -> str:
         """
@@ -894,6 +949,8 @@ class PRReviewer:
         the feedback.
         """
         data = self.prediction_data if self.prediction_data is not None else self._load_review_yaml(self.prediction)
+        if self.prediction_data is None:
+            self._validate_review_schema(data)
         github_action_output(data, 'review')
 
         if not isinstance(data, dict) or not isinstance(data.get('review'), dict) or not data['review']:
@@ -1179,7 +1236,9 @@ class PRReviewer:
         question_str = ""
         answer_str = ""
 
-        if self.is_answer:
+        if self.is_answer and self.git_provider.is_supported("get_issue_comments"):
+            # __init__ already raises when is_answer is True and this is unsupported, so
+            # this repeats that check locally rather than relying on the caller for it.
             discussion_messages = self.git_provider.get_issue_comments()
 
             # providers return the comments oldest-first. PyGithub's PaginatedList reverses lazily,
@@ -1223,12 +1282,17 @@ class PRReviewer:
         num_commits_threshold = get_settings().pr_reviewer.minimal_commits_for_incremental_review
         not_enough_commits = num_new_commits < num_commits_threshold
         # checking if the commits are not too recent to start the review
-        recent_commits_threshold = datetime.datetime.now() - datetime.timedelta(
+        recent_commits_threshold = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None) - datetime.timedelta(
             minutes=get_settings().pr_reviewer.minimal_minutes_for_incremental_review
         )
         last_seen_commit_date = (
             self.incremental.last_seen_commit.commit.author.date if self.incremental.last_seen_commit else None
         )
+        # PyGithub returns timezone-aware UTC commit dates; the threshold below is a
+        # naive datetime. Normalize to naive UTC so the comparison cannot raise
+        # TypeError, matching how the GitLab and Azure providers emit commit dates.
+        if last_seen_commit_date is not None and last_seen_commit_date.tzinfo is not None:
+            last_seen_commit_date = last_seen_commit_date.astimezone(datetime.timezone.utc).replace(tzinfo=None)
         all_commits_too_recent = (
             last_seen_commit_date > recent_commits_threshold if self.incremental.last_seen_commit else False
         )

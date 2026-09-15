@@ -25,12 +25,12 @@ def _added_file(filename="src/example.py", lines=("a = 1", "b = 2", "c = 3")):
 
 class TestBitbucketProvider:
     @staticmethod
-    def _code_suggestion(line: int):
+    def _code_suggestion(line: int, end_line: int = None):
         return {
             "body": "**Suggestion:** fix it",
             "relevant_file": "src/example.py",
             "relevant_lines_start": line,
-            "relevant_lines_end": line,
+            "relevant_lines_end": line if end_line is None else end_line,
         }
 
     @staticmethod
@@ -636,6 +636,73 @@ not a valid hunk
         assert result is True
         request.assert_not_called()
 
+    def test_publish_code_suggestions_anchors_a_multi_line_suggestion_to_the_whole_range(self):
+        provider = self._provider_for_code_suggestions()
+        response = self._inline_comment_response(201)
+
+        with patch("pr_agent.git_providers.bitbucket_provider.requests.request", return_value=response) as request:
+            result = provider.publish_code_suggestions([self._code_suggestion(10, 16)])
+
+        assert result is True
+        request.assert_called_once_with(
+            "POST",
+            provider.bitbucket_comment_api_url,
+            data='{"content": {"raw": "**Suggestion:** fix it"}, '
+                 '"inline": {"start_to": 10, "to": 16, "path": "src/example.py"}}',
+            headers=provider.headers,
+        )
+
+    def test_publish_code_suggestions_keeps_a_single_line_suggestion_on_one_line(self):
+        provider = self._provider_for_code_suggestions()
+        response = self._inline_comment_response(201)
+
+        with patch("pr_agent.git_providers.bitbucket_provider.requests.request", return_value=response) as request:
+            result = provider.publish_code_suggestions([self._code_suggestion(2)])
+
+        assert result is True
+        request.assert_called_once_with(
+            "POST",
+            provider.bitbucket_comment_api_url,
+            data='{"content": {"raw": "**Suggestion:** fix it"}, "inline": {"to": 2, "path": "src/example.py"}}',
+            headers=provider.headers,
+        )
+
+    @pytest.mark.parametrize("end", [{"line": 7}, {"line": 6}, {"line": None}, {}],
+                             ids=["end equal", "end below", "end null", "end absent"])
+    def test_publish_inline_comments_stays_single_line_without_a_real_range(self, end):
+        # Only a genuine span may become 'start_to'; everything else stays a single-line comment.
+        provider = self._provider_for_code_suggestions()
+        response = self._inline_comment_response(201)
+        comment = {"body": "watch out", "path": "src/example.py", "start_line": 7, **end}
+
+        with patch("pr_agent.git_providers.bitbucket_provider.requests.request", return_value=response) as request:
+            result = provider.publish_inline_comments([comment])
+
+        assert result is True
+        request.assert_called_once_with(
+            "POST",
+            provider.bitbucket_comment_api_url,
+            data='{"content": {"raw": "watch out"}, "inline": {"to": 7, "path": "src/example.py"}}',
+            headers=provider.headers,
+        )
+
+    def test_publish_inline_comments_truncates_a_multi_line_body(self):
+        provider = self._provider_for_code_suggestions()
+        provider.max_comment_length = 10
+        response = self._inline_comment_response(201)
+        comment = {"body": "x" * 50, "path": "src/example.py", "start_line": 3, "line": 5}
+
+        with patch("pr_agent.git_providers.bitbucket_provider.requests.request", return_value=response) as request:
+            result = provider.publish_inline_comments([comment])
+
+        assert result is True
+        request.assert_called_once_with(
+            "POST",
+            provider.bitbucket_comment_api_url,
+            data='{"content": {"raw": "xxxxxxx..."}, '
+                 '"inline": {"start_to": 3, "to": 5, "path": "src/example.py"}}',
+            headers=provider.headers,
+        )
 
     def test_get_issue_comments_normalizes_cloud_comments(self):
         provider = BitbucketProvider.__new__(BitbucketProvider)
@@ -677,6 +744,26 @@ not a valid hunk
             f"**[Persistent review]({comment_url})** updated to latest commit "
             "https://bitbucket.org/acme/repo/commits/head"
         )
+
+
+    def test_get_languages_returns_empty_map_when_repo_has_no_language(self):
+        # Bitbucket Cloud reports "language": null for repos it cannot classify;
+        # get_languages() must not emit a {None: 0} key or sort_files_by_main_languages()
+        # crashes on None.lower() (issue #3340).
+        repo = MagicMock()
+        repo.get_data.side_effect = lambda key: None
+        provider = BitbucketProvider.__new__(BitbucketProvider)
+        provider.repo = repo
+
+        assert provider.get_languages() == {}
+
+    def test_get_languages_includes_detected_language(self):
+        repo = MagicMock()
+        repo.get_data.side_effect = lambda key: "Python"
+        provider = BitbucketProvider.__new__(BitbucketProvider)
+        provider.repo = repo
+
+        assert provider.get_languages() == {"Python": 0}
 
 class TestBitbucketServerProvider:
     @staticmethod
@@ -1115,6 +1202,24 @@ class TestBitbucketServerProvider:
 
         assert content == "repo context"
         provider.get_file.assert_called_once_with("AGENTS.md", "base-sha")
+
+    def test_remove_comment_deletes_comment_with_id_and_version(self):
+        provider = self._persistent_provider()
+        comment = SimpleNamespace(id=7, version=3)
+
+        assert provider.remove_comment(comment) is True
+
+        provider.bitbucket_client.delete_pull_request_comment.assert_called_once_with(
+            "AAA", "my-repo", 1, 7, 3
+        )
+
+    def test_remove_comment_rejects_missing_version(self):
+        provider = self._persistent_provider()
+        comment = {"id": 7}
+
+        assert provider.remove_comment(comment) is False
+
+        provider.bitbucket_client.delete_pull_request_comment.assert_not_called()
 
     def test_get_repo_file_content_from_default_branch(self):
         provider = BitbucketServerProvider.__new__(BitbucketServerProvider)

@@ -72,7 +72,7 @@ class BitbucketServerProvider(GitProvider):
         try:
             parsed_url = urlparse(self.pr_url)
             return f"{parsed_url.scheme}://{parsed_url.netloc}/scm/{self.workspace_slug.lower()}/{self.repo_slug.lower()}.git"
-        except Exception as e:
+        except Exception:
             get_logger().exception(f"url is not a valid merge requests url: {self.pr_url}")
             return ""
 
@@ -411,7 +411,26 @@ class BitbucketServerProvider(GitProvider):
             get_logger().exception(f"Failed to remove temp comments, error: {e}")
 
     def remove_comment(self, comment):
-        pass
+        comment_id = comment.get("id") if isinstance(comment, dict) else getattr(comment, "id", None)
+        comment_version = comment.get("version") if isinstance(comment, dict) else getattr(comment, "version", None)
+        if not isinstance(comment_id, int) or not isinstance(comment_version, int):
+            get_logger().warning(
+                f"Failed to remove Bitbucket Server comment: invalid id or version for {comment!r}"
+            )
+            return False
+
+        try:
+            self.bitbucket_client.delete_pull_request_comment(
+                self.workspace_slug,
+                self.repo_slug,
+                self.pr_num,
+                comment_id,
+                comment_version,
+            )
+            return True
+        except Exception as e:
+            get_logger().exception(f"Failed to remove comment, error: {e}")
+            return False
 
     # function to create_inline_comment
     def create_inline_comment(self, body: str, relevant_file: str, relevant_line_in_file: str,
