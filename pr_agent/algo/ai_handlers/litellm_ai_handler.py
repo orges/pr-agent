@@ -9,6 +9,7 @@ import os
 import re
 import shutil
 import stat
+import threading
 from contextvars import ContextVar
 from functools import lru_cache, wraps
 from types import FunctionType, SimpleNamespace
@@ -104,7 +105,7 @@ PROVIDER_SETTING_ALIASES = {
     "vertex_ai_beta": "vertex_ai",
 }
 
-# Keep chat-completion endpoint aliases in the same precedence order as LiteLLM 1.100.0.
+# Keep chat-completion endpoint aliases in the same precedence order as LiteLLM 1.101.0.
 # Native completion masks BASETEN_API_BASE, MISTRAL_API_BASE and ARK_API_BASE;
 # VERTEX_API_BASE belongs to embedding, not chat. Do not promote them to explicit routing.
 PROVIDER_API_BASE_ENV_VARS = {
@@ -228,7 +229,7 @@ PROVIDER_ROUTING_ENV_VARS = {
     "watsonx_text": dict(_WATSONX_ROUTING_ENV_VARS),
 }
 
-# Keep aliases in the same precedence order as LiteLLM 1.100.0.
+# Keep aliases in the same precedence order as LiteLLM 1.101.0.
 PROVIDER_API_KEY_ENV_VARS = {
     "ai21": ("AI21_API_KEY",),
     "ai21_chat": ("AI21_API_KEY",),
@@ -618,9 +619,13 @@ def _install_azure_oidc_bridge():
 
     @wraps(original_resolve_env)
     def resolve_env(owner, litellm_params, param_key, env_var_key):
-        context = _azure_oidc_request.get()
+        context = _azure_oidc_request.get() or _azure_ad_responses_request.get()
         if (
-            context is not None and litellm_params.get("azure_ad_token") == context["dispatch_token"]
+            context is not None
+            and (
+                litellm_params.get("azure_ad_token") == context["dispatch_token"]
+                or (context.get("companion") and litellm_params.get("azure_ad_token") is None)
+            )
             and env_var_key in context["auth_environment"]
         ):
             value = litellm_params.get(param_key)
@@ -629,12 +634,15 @@ def _install_azure_oidc_bridge():
 
     @wraps(original_initialize)
     def initialize(*args, **kwargs):
-        context = _azure_oidc_request.get()
+        context = _azure_oidc_request.get() or _azure_ad_responses_request.get()
         if context is None:
             return original_initialize(*args, **kwargs)
         bound = initialize_signature.bind(*args, **kwargs)
         params = bound.arguments.get("litellm_params") or {}
-        if params.get("azure_ad_token") != context["dispatch_token"]:
+        if not (
+            params.get("azure_ad_token") == context["dispatch_token"]
+            or (context.get("companion") and params.get("azure_ad_token") is None)
+        ):
             return original_initialize(*args, **kwargs)
         native_globals = _azure_oidc_companion_globals(original_initialize.__globals__, context)
         factory = FunctionType(
@@ -647,10 +655,16 @@ def _install_azure_oidc_bridge():
     @wraps(original_cache_key)
     def cache_key(client_initialization_params, client_type):
         key = original_cache_key(client_initialization_params, client_type)
-        context = _azure_oidc_request.get()
+        context = _azure_oidc_request.get() or _azure_ad_responses_request.get()
         if (
             context is not None and client_type == "azure"
-            and client_initialization_params.get("azure_ad_token") == context["selector_hash"]
+            and (
+                client_initialization_params.get("azure_ad_token") == context.get("selector_hash")
+                or (
+                    context.get("companion")
+                    and client_initialization_params.get("azure_ad_token") is None
+                )
+            )
         ):
             return f"{key}|pr_agent_oidc={context['identity_hash']}"
         return key
@@ -658,13 +672,18 @@ def _install_azure_oidc_bridge():
     @wraps(original_client)
     def client(*args, **kwargs):
         context = _azure_oidc_request.get()
+        if context is None:
+            context = _azure_ad_responses_request.get()
         if context is None or not context["generated_guard"]:
             return original_client(*args, **kwargs)
         bound = client_signature.bind(*args, **kwargs)
         params = bound.arguments.get("litellm_params") or {}
         if (
             bound.arguments.get("api_key") == DUMMY_LITELLM_API_KEY
-            and params.get("azure_ad_token") == context["dispatch_token"]
+            and (
+                params.get("azure_ad_token") == context["dispatch_token"]
+                or (context.get("companion") and params.get("azure_ad_token") is None)
+            )
         ):
             # Dispatch has already resolved fallbacks. Restore native keyless
             # selection before the SDK initializer and its client-cache lookup.
@@ -986,7 +1005,7 @@ def _get_bedrock_model_region(model: str, model_id=None) -> str | None:
     """Resolve only the region carried by the request, without ambient AWS discovery."""
     from litellm.llms.bedrock.common_utils import BedrockModelInfo
 
-    # LiteLLM 1.100.0 consumes model_id before Invoke resolves its region.
+    # LiteLLM 1.101.0 consumes model_id before Invoke resolves its region.
     # Only Converse uses that separate ID or region/model path for routing.
     is_converse = BedrockModelInfo.get_bedrock_route(model) == "converse"
     if not is_converse:
@@ -1002,7 +1021,7 @@ def _get_bedrock_model_region(model: str, model_id=None) -> str | None:
     arn_candidate = candidate
     if not model_id:
         arn_candidate = arn_candidate.removeprefix("invoke/")
-        # Match the native chat model prefixes in LiteLLM 1.100.0 without
+        # Match the native chat model prefixes in LiteLLM 1.101.0 without
         # decoding an ARN or changing Converse's region/model path grammar.
         for prefix in ("llama/", "deepseek_r1/", "openai/", "qwen2/", "qwen3/", "moonshot/", "nova-2/", "nova/"):
             if arn_candidate.startswith(prefix):
@@ -1072,7 +1091,7 @@ def _guard_request_routing_globals(provider: str | None, params: dict) -> dict:
             and parameter in params
             and live_value != params[parameter]
         ):
-            # LiteLLM 1.100.0's ChatGPT chat transformation ignores the request
+            # LiteLLM 1.101.0's ChatGPT chat transformation ignores the request
             # api_base and re-reads these variables when resolving provider info.
             raise ValueError("Refusing changed live api_base environment for provider chatgpt")
     return params
@@ -1584,7 +1603,7 @@ def _install_vertex_executable_guard():
         setattr(guarded, marker, original)
         return guarded
 
-    # LiteLLM 1.100.0 reads expired (sync) or token_state (async) on the
+    # LiteLLM 1.101.0 reads expired (sync) or token_state (async) on the
     # actual cached credential before returning its token. Guarding the
     # descriptors also covers cache replacement during an async lock wait.
     for name in ("from_info", "refresh", "expired", "token_state"):
@@ -1611,7 +1630,7 @@ def _install_vertex_executable_guard():
 
 
 def _install_vertex_wif_project_bridge():
-    """Restore ADC project discovery for request-owned WIF JSON in LiteLLM 1.100.0."""
+    """Restore ADC project discovery for request-owned WIF JSON in LiteLLM 1.101.0."""
     from litellm.llms.vertex_ai.vertex_llm_base import VertexBase
 
     original = VertexBase.load_auth
@@ -1630,7 +1649,7 @@ def _install_vertex_wif_project_bridge():
         if json_obj != snapshot:
             return original(self, credentials, project_id)
 
-        # Preserve LiteLLM 1.100.0's WIF factories, including its explicit AWS
+        # Preserve LiteLLM 1.101.0's WIF factories, including its explicit AWS
         # supplier. Only project discovery is missing from its JSON load path.
         scopes = ["https://www.googleapis.com/auth/cloud-platform"]
         source = json_obj.get("credential_source", {})
@@ -1672,7 +1691,7 @@ def _install_vertex_wif_project_bridge():
 
 
 def _install_vertex_impersonated_credentials_bridge():
-    """Add LiteLLM 1.100.0's missing ADC type without replacing its refresh/cache path."""
+    """Add LiteLLM 1.101.0's missing ADC type without replacing its refresh/cache path."""
     from litellm.llms.vertex_ai.vertex_llm_base import VertexBase
 
     original = VertexBase._credentials_from_service_account
@@ -1902,6 +1921,30 @@ def _as_list(value) -> list:
     return []
 
 
+def _coerce_string_list_config(value):
+    """Return a list-like config value while accepting env-style strings."""
+    if not value:
+        return []
+    if isinstance(value, list):
+        return value
+    if isinstance(value, tuple):
+        return list(value)
+    if isinstance(value, str):
+        stripped_value = value.strip()
+        if not stripped_value:
+            return []
+        if stripped_value.startswith("[") and stripped_value.endswith("]"):
+            try:
+                parsed_value = json.loads(stripped_value)
+            except json.JSONDecodeError:
+                return None
+            if isinstance(parsed_value, list):
+                return parsed_value
+            return None
+        return [model.strip() for model in stripped_value.split(",") if model.strip()]
+    return None
+
+
 def _configured_client_retries():
     """config.num_retries as a non-negative int, or None (unset/invalid = client defaults).
 
@@ -1996,6 +2039,7 @@ class LiteLLMAIHandler(BaseAiHandler):
         self._aws_credential_chain_environment = {}
         self._aws_credential_chain_files = {}
         self._aws_bedrock_lock = asyncio.Lock()
+        self._aws_refresh_lock = threading.Lock()
         self._vertex_credentials, self._vertex_credentials_error = self._snapshot_vertex_credentials()
         self._vertex_aws_environment = {
             variable: os.environ.get(variable)
@@ -2149,8 +2193,30 @@ class LiteLLMAIHandler(BaseAiHandler):
         # Model that doesn't support temperature argument
         self.no_support_temperature_models = NO_SUPPORT_TEMPERATURE_MODELS
 
-        # Models that support reasoning effort
-        self.support_reasoning_models = SUPPORT_REASONING_EFFORT_MODELS
+        # Append config-listed models to the built-in reasoning-effort list
+        additional_reasoning_models = _coerce_string_list_config(
+            get_settings().config.get("additional_reasoning_effort_models", [])
+        )
+        if additional_reasoning_models is None:
+            get_logger().warning(
+                "Invalid additional_reasoning_effort_models in config; expected a list of model names. "
+                "Falling back to the built-in reasoning-effort model list."
+            )
+            additional_reasoning_models = []
+        elif additional_reasoning_models and not all(
+            isinstance(model, str) and model.strip() for model in additional_reasoning_models
+        ):
+            get_logger().warning(
+                "Invalid additional_reasoning_effort_models in config; "
+                "expected a list of model name strings. "
+                "Falling back to the built-in reasoning-effort model list."
+            )
+            additional_reasoning_models = []
+        # Store stripped names so exact-match checks against the model succeed even when the
+        # config entries contain surrounding whitespace (validation above already used strip()).
+        self.support_reasoning_models = SUPPORT_REASONING_EFFORT_MODELS + [
+            model.strip() for model in additional_reasoning_models
+        ]
 
         # Models that support extended thinking (config override replaces the built-in list when non-empty)
         override = get_settings().config.get("claude_extended_thinking_models_override", []) or []
@@ -2575,7 +2641,7 @@ class LiteLLMAIHandler(BaseAiHandler):
                 try:
                     region = session.region_name
                 except Exception as e:
-                    get_logger().warning(f"AWS_USE_IMDS: failed to resolve region via boto3: {e}")
+                    get_logger().warning(f"AWS_USE_IMDS: failed to resolve region via boto3: {type(e).__name__}")
             creds = session.get_credentials()
             if creds:
                 frozen_credentials = creds.get_frozen_credentials()
@@ -2588,9 +2654,11 @@ class LiteLLMAIHandler(BaseAiHandler):
                 get_logger().warning(
                     "AWS_USE_IMDS is set but boto3 found no credentials; falling through to static keys"
                 )
-        except (botocore.exceptions.BotoCoreError, botocore.exceptions.ClientError, OSError):
-            get_logger().exception(
-                "AWS_USE_IMDS: failed to resolve credentials via boto3; falling through to static keys"
+        except (botocore.exceptions.BotoCoreError, botocore.exceptions.ClientError, OSError) as e:
+            # Keep provider error text and traceback locals out of credential-resolution logs.
+            get_logger().error(
+                "AWS_USE_IMDS: failed to resolve credentials via boto3; falling through to static keys: "
+                f"{type(e).__name__}"
             )
 
         if not region:
@@ -2659,7 +2727,22 @@ class LiteLLMAIHandler(BaseAiHandler):
             params["aws_region_name"] = region
         return params
 
-    def _refresh_aws_imds_credentials(self) -> bool:
+    def _read_aws_frozen_credentials(self, credentials):
+        """Serialize SDK refreshes without modifying handler request state."""
+        try:
+            with self._aws_refresh_lock:
+                self._validate_aws_credential_chain_environment()
+                frozen = credentials.get_frozen_credentials()
+                self._validate_aws_credential_chain_environment()
+                return frozen
+        except Exception as error:
+            # Keep worker errors observable after cancellation without exposing
+            # provider details or replacing SDK errors when logging fails.
+            with contextlib.suppress(Exception):
+                get_logger().error(f"AWS credential refresh failed: {type(error).__name__}")
+            raise
+
+    async def _refresh_aws_imds_credentials(self) -> bool:
         """Refresh ambient AWS credentials from boto3 provider chain. Called before each Bedrock call
         to avoid serving stale credentials from long-lived processes (EC2 roles rotate every ~6h).
 
@@ -2671,16 +2754,17 @@ class LiteLLMAIHandler(BaseAiHandler):
             if self._aws_boto3_creds is None:
                 get_logger().warning("IMDS credential refresh: no boto3 credentials object stored")
                 return False
-            self._validate_aws_credential_chain_environment()
             region = self._aws_active_creds.get("aws_region_name")
-            frozen_credentials = self._aws_boto3_creds.get_frozen_credentials()
-            self._validate_aws_credential_chain_environment()
-            self._aws_active_creds = self._aws_request_params_from_frozen(frozen_credentials, region)
-            return True
+            frozen_credentials = await asyncio.to_thread(self._read_aws_frozen_credentials, self._aws_boto3_creds)
+            params = self._aws_request_params_from_frozen(frozen_credentials, region)
         except (botocore.exceptions.BotoCoreError, botocore.exceptions.ClientError, OSError):
             # ClientError (STS/AssumeRole failures) is not a BotoCoreError subclass.
-            get_logger().exception("IMDS credential refresh failed")
             return False
+        # Commit only the uncancelled caller's result under the async lock.
+        # Recheck after resumption without turning trust failures into fallback.
+        self._validate_aws_credential_chain_environment()
+        self._aws_active_creds = params
+        return True
 
     def _activate_static_aws_fallback(self):
         """Select static request credentials for an AWS provider fallback after IMDS failure."""
@@ -2770,14 +2854,14 @@ class LiteLLMAIHandler(BaseAiHandler):
 
     @contextlib.asynccontextmanager
     async def _snapshot_aws_request_credentials(self, enabled):
-        """Refresh synchronously and serialize this handler's AWS call and static fallback."""
+        """Refresh off-loop and serialize this handler's AWS call and static fallback."""
         if not enabled:
             yield dict(self._aws_active_creds), False
             return
         async with self._aws_bedrock_lock:
             if not self._aws_imds_fell_back:
                 self._validate_aws_credential_chain_environment()
-                if self._aws_imds_mode and not self._refresh_aws_imds_credentials() and self._aws_static_creds:
+                if self._aws_imds_mode and not await self._refresh_aws_imds_credentials() and self._aws_static_creds:
                     self._activate_static_aws_fallback()
             can_fallback = self._aws_imds_mode and not self._aws_imds_fell_back and bool(self._aws_static_creds)
             yield dict(self._aws_active_creds), can_fallback
@@ -3094,7 +3178,7 @@ class LiteLLMAIHandler(BaseAiHandler):
         if provider == "bedrock" and "api_key" not in params and _has_live_provider_api_key_environment(provider):
             raise ValueError("Refusing process-wide Bedrock bearer token fallback")
         if provider in ("sagemaker_chat", "sagemaker_nova") and os.environ.get("AWS_BEARER_TOKEN_BEDROCK"):
-            # LiteLLM 1.100.0's SageMaker signer ignores its api_key argument and
+            # LiteLLM 1.101.0's SageMaker signer ignores its api_key argument and
             # otherwise reads this Bedrock-only token directly from the environment.
             raise ValueError("Refusing Bedrock bearer token fallback for SageMaker")
         if provider == "azure" and getattr(self, "_azure_ad", False):
@@ -3173,7 +3257,7 @@ class LiteLLMAIHandler(BaseAiHandler):
             )
             if not uses_bedrock_bearer:
                 if any(os.environ.get(variable) for variable in LITELLM_AWS_CREDENTIAL_SELECTOR_ENV_VARS):
-                    # LiteLLM 1.100.0 resolves these selectors ahead of explicit
+                    # LiteLLM 1.101.0 resolves these selectors ahead of explicit
                     # request credentials, which would replace the isolated keys.
                     raise ValueError(f"Refusing ambient LiteLLM AWS credential selector for provider {provider}")
                 aws_request_credentials = dict(aws_request_credentials or {})
@@ -3628,6 +3712,47 @@ class LiteLLMAIHandler(BaseAiHandler):
             system_prompt = "No system prompt provided"
         return system_prompt, user_prompt
 
+    def build_request_messages(
+        self,
+        model: str,
+        system_prompt: str,
+        user_prompt: str,
+        *,
+        image_path: str | None = None,
+    ) -> list[dict]:
+        """Build the exact message payload for normalized prompt strings."""
+        combine_prompts = (
+            self._uses_user_message_only(model)
+            or get_settings().config.custom_reasoning_model
+        )
+        if combine_prompts:
+            user_prompt = f"{system_prompt}\n\n\n{user_prompt}"
+            content = user_prompt
+            if image_path:
+                content = [
+                    {"type": "text", "text": user_prompt},
+                    {"type": "image_url", "image_url": {"url": image_path}},
+                ]
+            return [{"role": "user", "content": content}]
+
+        user_content = user_prompt
+        if image_path:
+            user_content = [
+                {"type": "text", "text": user_prompt},
+                {"type": "image_url", "image_url": {"url": image_path}},
+            ]
+        return [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_content},
+        ]
+
+    def _uses_user_message_only(self, model: str) -> bool:
+        """Recognize user-only models through any routed provider prefix."""
+        return any(
+            model == registered_model or model.endswith(f"/{registered_model}")
+            for registered_model in self.user_message_only_models
+        )
+
     def _configure_claude_extended_thinking(self, model: str, kwargs: dict) -> dict:
         """
         Configure Claude extended thinking parameters if applicable.
@@ -3912,11 +4037,12 @@ class LiteLLMAIHandler(BaseAiHandler):
                     get_logger().warning(
                         "Empty system prompt for claude model. Adding a newline character to prevent OpenAI API error.")
                 system = normalized_system
-                messages = [{"role": "system", "content": system}, {"role": "user", "content": user}]
-
-                if img_path:
-                    messages[1]["content"] = [{"type": "text", "text": messages[1]["content"]},
-                                              {"type": "image_url", "image_url": {"url": img_path}}]
+                messages = self.build_request_messages(
+                    model,
+                    system,
+                    user,
+                    image_path=img_path,
+                )
 
                 thinking_kwargs_gpt5 = None
                 openrouter_reasoning_effort = None
@@ -3966,16 +4092,10 @@ class LiteLLMAIHandler(BaseAiHandler):
                     model_family = "GPT-6 Astra" if is_gpt6_astra else "GPT-5"
                     get_logger().info(f"Using reasoning_effort='{effort}' for {model_family} model")
                 # Currently, some models do not support a separate system and user prompts
-                if model in self.user_message_only_models or get_settings().config.custom_reasoning_model:
+                if self._uses_user_message_only(model) or get_settings().config.custom_reasoning_model:
                     user = f"{system}\n\n\n{user}"
                     system = ""
                     get_logger().info(f"Using model {model}, combining system and user prompts")
-                    if img_path:
-                        content = [{"type": "text", "text": user},
-                                   {"type": "image_url", "image_url": {"url": img_path}}]
-                    else:
-                        content = user
-                    messages = [{"role": "user", "content": content}]
 
                 # Build request kwargs after normalizing the model and messages so credentials and
                 # endpoints can be selected for the provider that will actually receive this call.
@@ -4012,7 +4132,9 @@ class LiteLLMAIHandler(BaseAiHandler):
                 # configured reasoning_effort is not silently dropped for models the
                 # user references with a provider prefix. OpenRouter routing variants
                 # such as :nitro and :floor are stripped only for this membership test.
-                if any(
+                # Skip GPT-5/GPT-6 Astra here so a model registered via config cannot
+                # overwrite the reasoning_effort normalization of its dedicated branch.
+                if not (is_gpt5_model or is_gpt6_astra) and any(
                     reasoning_model == m or reasoning_model.endswith("/" + m)
                     for m in self.support_reasoning_models
                 ):
@@ -4046,18 +4168,21 @@ class LiteLLMAIHandler(BaseAiHandler):
                         else:
                             get_logger().info(f"Adding reasoning_effort with value {reasoning_effort} to model {model}.")
                             kwargs["reasoning_effort"] = reasoning_effort
-                            if self._grok_reasoning_levels_for(model):
-                                try:
-                                    supported_params = litellm.get_supported_openai_params(
-                                        model=model,
-                                        custom_llm_provider=custom_llm_provider or None,
-                                    ) or []
-                                except Exception:
-                                    supported_params = []
-                                # LiteLLM may omit reasoning_effort for grok-build-latest
-                                # and OpenAI-compatible gateway-prefixed Grok IDs.
-                                if "reasoning_effort" not in supported_params:
-                                    kwargs["allowed_openai_params"] = ["reasoning_effort"]
+                            # Whitelist reasoning_effort through allowed_openai_params when
+                            # LiteLLM omits it from the params it reports for unknown or
+                            # OpenAI-compatible gateway-prefixed model IDs. Merge into any
+                            # existing allowed_openai_params instead of overwriting it.
+                            try:
+                                supported_params = litellm.get_supported_openai_params(
+                                    model=model,
+                                    custom_llm_provider=custom_llm_provider or None,
+                                ) or []
+                            except Exception:
+                                supported_params = []
+                            if "reasoning_effort" not in supported_params:
+                                allowed_params = kwargs.get("allowed_openai_params") or []
+                                if "reasoning_effort" not in allowed_params:
+                                    kwargs["allowed_openai_params"] = [*allowed_params, "reasoning_effort"]
 
                 # https://docs.anthropic.com/en/docs/build-with-claude/extended-thinking
                 adaptive_thinking_enabled = self._claude_thinking_controls["enable_claude_adaptive_thinking"]
@@ -4506,6 +4631,13 @@ class LiteLLMAIHandler(BaseAiHandler):
                     "companion": companion_auth,
                     "environment": environment,
                     "auth_environment": {**environment, **self._azure_oidc_auth_environment},
+                    "selector_hash": hashlib.sha256(azure_ad_token.encode()).hexdigest()
+                    if isinstance(azure_ad_token, str) else None,
+                    "identity_hash": hashlib.sha256(
+                        json.dumps(
+                            {**environment, **self._azure_oidc_auth_environment}, sort_keys=True
+                        ).encode()
+                    ).hexdigest(),
                 })
             if provider == "azure" and (oidc_selector or ordinary_sdk_auth):
                 _install_azure_oidc_bridge()

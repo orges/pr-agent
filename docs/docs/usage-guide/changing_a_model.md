@@ -316,10 +316,17 @@ Set `AWS_USE_IMDS=true` in the environment. PR-Agent will resolve credentials vi
 | EKS pod with IRSA | Web identity token + STS |
 | Lambda function | Runtime-injected credentials |
 
-Credential discovery runs synchronously when the handler is initialized. Before each SigV4 call, PR-Agent
-refreshes credentials synchronously through the same boto3 credentials object and passes a request-local snapshot
-to LiteLLM, without writing credentials into the process environment. AWS calls using this provider chain are
-serialized within a handler, including any static-credential retry. Discovery and refresh can block the event loop.
+Credential discovery runs during handler initialization. Before each eligible SigV4 request, refresh through the
+same boto3 credentials object runs in a background thread. Non-AWS and bearer-authenticated requests do not trigger
+this refresh. PR-Agent passes a request-local snapshot to LiteLLM without writing credentials into the process
+environment. Constructor discovery and credential-file fingerprinting remain synchronous.
+
+AWS calls using this provider chain remain serialized within a handler, including any static-credential retry.
+Cancelling a request does not stop an already-running boto3 refresh, but its result cannot overwrite the handler's
+credentials or static-fallback decision. A separate lock serializes SDK refreshes, including cancelled callers'
+unfinished work. Refresh uses the event loop's shared default executor: blocked operations and workers waiting for
+the SDK lock after repeated cancellations can delay unrelated executor work and process shutdown. No service-wide
+worker quota or additional SDK timeout is introduced.
 
 The same opt-in is required for other boto3 provider-chain sources, including `AWS_PROFILE` and shared credentials
 files. LiteLLM-specific `AWS_PROFILE_NAME` and `AWS_ROLE_NAME` selectors are not supported because they can override
@@ -712,7 +719,7 @@ model = "github_copilot/gpt-4o"
 fallback_models = ["github_copilot/gpt-4.1"]
 ```
 
-The GitHub identity behind the model needs an active Copilot subscription. The token budget for a Copilot model is resolved automatically from litellm's model metadata (verified against the pinned litellm 1.100.0), so `custom_model_max_tokens` is not required. However, `get_max_tokens` clamps the effective window to `config.max_model_tokens`, which defaults to 32000. To use the full context window of the model (e.g., 64000 for gpt-4o, 128000 for gpt-4.1), raise `config.max_model_tokens` accordingly.
+The GitHub identity behind the model needs an active Copilot subscription. The token budget for a Copilot model is resolved automatically from litellm's model metadata (verified against the pinned litellm 1.101.0), so `custom_model_max_tokens` is not required. However, `get_max_tokens` clamps the effective window to `config.max_model_tokens`, which defaults to 32000. To use the full context window of the model (e.g., 64000 for gpt-4o, 128000 for gpt-4.1), raise `config.max_model_tokens` accordingly.
 
 Authentication uses the [GitHub Copilot provider](https://docs.litellm.ai/docs/providers/github_copilot) flow:
 
@@ -787,6 +794,8 @@ reasoning_effort = "medium" # "none", "minimal", "low", "medium", "high", "xhigh
 ```
 
 With the OpenAI models that support reasoning effort (eg: gpt-5.6-terra), you can specify its reasoning effort via `config` section. The default value is `medium`. You can change it to any supported value based on your usage. Available values depend on the model and provider.
+
+For a model served through an OpenAI-compatible endpoint that is not in the built-in [`SUPPORT_REASONING_EFFORT_MODELS`](https://github.com/the-pr-agent/pr-agent/blob/main/pr_agent/algo/__init__.py) list, add its ID to `config.additional_reasoning_effort_models`. The list is additive: built-in reasoning models keep receiving `config.reasoning_effort`, and IDs match exactly or through any provider prefix (e.g. `"deepseek-v4-flash-0731"` matches `"openai/deepseek-v4-flash-0731"`). When LiteLLM does not recognize the model, PR-Agent sets `allowed_openai_params = ["reasoning_effort"]` so the parameter reaches the endpoint. Note the default `"medium"` may be rejected by providers that accept a different subset (e.g. `"none"/"low"/"high"/"max"`); adding a custom model ID surfaces that provider-side error instead of silently dropping the setting.
 
 To use [GPT-6 Astra](https://developers.openai.com/api/docs/models/gpt-6-astra):
 

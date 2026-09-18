@@ -9,9 +9,9 @@ import time
 import traceback
 from datetime import datetime
 from typing import Optional, Tuple
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
-from github import Auth, Github, GithubException, GithubIntegration, GithubRetry
+from github import Auth, Github, GithubException, GithubIntegration, GithubRetry, RateLimitExceededException
 from github.Issue import Issue
 from retry.api import retry_call
 from starlette_context import context
@@ -44,6 +44,7 @@ from .git_provider import (
     FilePatchInfo,
     GitProvider,
     IncrementalPR,
+    get_config_branch,
     redact_credentials,
 )
 
@@ -57,6 +58,10 @@ def _next_page_url(headers: dict) -> str:
         if match:
             return match.group(1)
     return ""
+
+
+class IncompletePullRequestFilesError(RuntimeError):
+    """Represent an incomplete or inconsistent GitHub pull-request file set."""
 
 
 class GithubProvider(GitProvider):
@@ -198,7 +203,7 @@ class GithubProvider(GitProvider):
             get_logger().error("Unable to get canonical url parts since missing context (PR or explicit git url)")
             return ("", "")
 
-        prefix = f"{scheme_and_netloc}/{owner}/{repo}/blob/{desired_branch}"
+        prefix = f"{scheme_and_netloc}/{owner}/{repo}/blob/{quote(desired_branch)}"
         suffix = ""  # github does not add a suffix
         return (prefix, suffix)
 
@@ -216,6 +221,16 @@ class GithubProvider(GitProvider):
         self.previous_review = self.get_previous_review(full=True, incremental=True)
         if self.previous_review:
             self.incremental.commits_range = self.get_commit_range()
+            if self.incremental.commits_range and self.incremental.last_seen_commit is None:
+                # Every commit post-dates the review (e.g. the branch was fully rebased), so there
+                # is no baseline commit to diff against. Fall back to a full review rather than
+                # diffing against a None ref, which silently yields empty original content.
+                get_logger().info(
+                    "Incremental review cannot anchor a base commit (no commit predates the "
+                    "previous review); falling back to a full review"
+                )
+                self.incremental.is_incremental = False
+                return
             # Get all files changed during the commit range
 
             for commit in self.incremental.commits_range:
@@ -227,11 +242,18 @@ class GithubProvider(GitProvider):
             get_logger().info("No previous review found, will review the entire PR")
             self.incremental.is_incremental = False
 
+    @staticmethod
+    def _commit_timeline_date(commit):
+        """Prefer the committer date: rebasing rewrites content but preserves the author
+        date, so anchoring on it classifies rewritten commits as already-reviewed."""
+        committer_date = getattr(getattr(commit.commit, 'committer', None), 'date', None)
+        return committer_date or commit.commit.author.date
+
     def get_commit_range(self):
         last_review_time = self.previous_review.created_at
         first_new_commit_index = None
         for index in range(len(self.pr_commits) - 1, -1, -1):
-            if self.pr_commits[index].commit.author.date > last_review_time:
+            if self._commit_timeline_date(self.pr_commits[index]) > last_review_time:
                 self.incremental.first_new_commit = self.pr_commits[index]
                 first_new_commit_index = index
             else:
@@ -250,20 +272,49 @@ class GithubProvider(GitProvider):
                 return self.comments[index]
         return None
 
+    def _get_complete_files(self):
+        if context.exists():
+            context_files = context.get("git_files", None)
+            if context_files is not None:
+                return context_files
+
+        git_files = getattr(self, "git_files", None)
+        if git_files is not None:
+            return git_files
+
+        for attempt in range(2):
+            try:
+                git_files = list(self.pr.get_files())  # 'list' to handle pagination
+                changed_files = self.pr.changed_files
+                if isinstance(changed_files, bool) or not isinstance(changed_files, int):
+                    raise IncompletePullRequestFilesError(
+                        f"GitHub returned an invalid changed_files count: {changed_files!r}"
+                    )
+                if len(git_files) != changed_files:
+                    raise IncompletePullRequestFilesError(
+                        f"GitHub returned {len(git_files)} pull-request files but reported {changed_files}"
+                    )
+                break
+            except IncompletePullRequestFilesError:
+                raise
+            except RateLimitExceededException:
+                raise
+            except GithubException as e:
+                if e.status == 429 or attempt == 1:
+                    raise
+            except Exception:
+                if attempt == 1:
+                    raise
+
+        self.git_files = git_files
+        if context.exists():
+            context["git_files"] = git_files
+        return git_files
+
     def get_files(self):
         if self.incremental.is_incremental and self.unreviewed_files_map:
-            return self.unreviewed_files_map.values()
-        try:
-            git_files = context.get("git_files", None)
-            if git_files:
-                return git_files
-            self.git_files = list(self.pr.get_files()) # 'list' to handle pagination
-            context["git_files"] = self.git_files
-            return self.git_files
-        except Exception:
-            if not self.git_files:
-                self.git_files = list(self.pr.get_files())
-            return self.git_files
+            return list(self.unreviewed_files_map.values())
+        return self._get_complete_files()
 
     def get_pr_file_paths(self):
         """Return the complete PR file set regardless of incremental review state.
@@ -275,19 +326,7 @@ class GithubProvider(GitProvider):
         move apply). Reuses the same context["git_files"] cache as get_files() and
         never falls back to the incremental-aware listing.
         """
-        try:
-            git_files = context.get("git_files", None)
-            if git_files:
-                return git_files
-            if getattr(self, "git_files", None):
-                return self.git_files
-            git_files = list(self.pr.get_files())
-            context["git_files"] = git_files
-            return git_files
-        except Exception:
-            if getattr(self, "git_files", None):
-                return self.git_files
-            return list(self.pr.get_files())
+        return self._get_complete_files()
 
     def get_num_of_files(self):
         if hasattr(self.git_files, "totalCount"):
@@ -378,7 +417,8 @@ class GithubProvider(GitProvider):
                         if counter_valid == MAX_FILES_ALLOWED_FULL:
                             get_logger().info("Too many files in PR, will avoid loading full content for rest of files")
 
-                    if avoid_load:
+                    pr_level_status = not (self.incremental.is_incremental and self.unreviewed_files_map)
+                    if avoid_load or (pr_level_status and file.status == "removed"):
                         new_file_content_str = ""
                     else:
                         new_file_content_str = self._get_pr_file_content(file, self.pr.head.sha)  # communication with GitHub
@@ -389,7 +429,7 @@ class GithubProvider(GitProvider):
                         patch = load_large_diff(file.filename, new_file_content_str, original_file_content_str)
                         self.unreviewed_files_map[file.filename] = patch
                     else:
-                        if avoid_load:
+                        if avoid_load or file.status == "added":
                             original_file_content_str = ""
                         else:
                             original_file_content_str = self._get_pr_file_content(file, merge_base_commit.sha, path=old_filename)
@@ -436,6 +476,8 @@ class GithubProvider(GitProvider):
 
             return diff_files
 
+        except IncompletePullRequestFilesError:
+            raise
         except Exception as e:
             get_logger().error(f"Failing to get diff files: {e}",
                                artifact={"traceback": traceback.format_exc()})
@@ -752,7 +794,7 @@ class GithubProvider(GitProvider):
             ]
         try:
             # publish all comments in a single message
-            self.pr.create_review(commit=self.last_commit_id, comments=comments)
+            self.pr.create_review(commit=self.last_commit_id, event="COMMENT", comments=comments)
             # The whole batch posted; record its fingerprints so the rest of this
             # run dedups against them. Cross-run dedup relies on the markers in the
             # posted bodies, so comments the fallback below drops stay unrecorded
@@ -942,7 +984,7 @@ class GithubProvider(GitProvider):
 
         # publish as a group the verified comments
         if verified_comments:
-            self.pr.create_review(commit=self.last_commit_id, comments=verified_comments)
+            self.pr.create_review(commit=self.last_commit_id, event="COMMENT", comments=verified_comments)
             published_count += len(verified_comments)
 
         # try to publish one by one the invalid comments as a one-line code comment
@@ -1207,12 +1249,7 @@ class GithubProvider(GitProvider):
         if global_settings:
             settings_files.append(("global", global_settings))
 
-        # Normalize each candidate before applying precedence so a whitespace-only
-        # settings value doesn't short-circuit the PR_AGENT_CONFIG_BRANCH fallback.
-        settings_branch = get_settings().get("CONFIG.CONFIG_BRANCH", None)
-        settings_branch = settings_branch.strip() if isinstance(settings_branch, str) else ""
-        env_branch = (os.environ.get("PR_AGENT_CONFIG_BRANCH") or "").strip()
-        config_branch = settings_branch or env_branch
+        config_branch = get_config_branch()
         if config_branch:
             # Only treat a missing branch/file (GithubException) as an expected
             # reason to fall back to the default branch. Unexpected errors are

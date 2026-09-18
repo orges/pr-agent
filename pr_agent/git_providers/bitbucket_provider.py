@@ -3,7 +3,7 @@ import json
 import re
 from types import SimpleNamespace
 from typing import Optional, Tuple
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 import requests
 from atlassian.bitbucket import Cloud
@@ -24,6 +24,10 @@ def _gef_filename(diff):
     if diff.new.path:
         return diff.new.path
     return diff.old.path
+
+
+def _split_raw_diff(raw_diff: str) -> list[str]:
+    return [part for part in re.split(r"(?m)(?=^diff --git )", raw_diff) if part.startswith("diff --git ")]
 
 
 class BitbucketProvider(GitProvider):
@@ -64,6 +68,7 @@ class BitbucketProvider(GitProvider):
         self.headers = s.headers
         self.bitbucket_client = Cloud(session=s)
         self.max_comment_length = 31000
+        self.max_comment_chars = self.max_comment_length
         self.workspace_slug = None
         self.repo_slug = None
         self.repo = None
@@ -71,6 +76,7 @@ class BitbucketProvider(GitProvider):
         self.pr = None
         self.pr_url = pr_url
         self.temp_comments = []
+        self._published_inline_comment_bodies = []
         self.incremental = incremental
         self.diff_files = None
         self.git_files = None
@@ -153,7 +159,7 @@ class BitbucketProvider(GitProvider):
             parsed_pr_url = urlparse(self.pr_url)
             scheme_and_netloc = parsed_pr_url.scheme + "://" + parsed_pr_url.netloc
             workspace_name, project_name = (self.workspace_slug, self.repo_slug)
-        prefix = f"{scheme_and_netloc}/{workspace_name}/{project_name}/src/{desired_branch}"
+        prefix = f"{scheme_and_netloc}/{workspace_name}/{project_name}/src/{quote(desired_branch)}"
         suffix = "" #None
         return (prefix, suffix)
 
@@ -285,7 +291,7 @@ class BitbucketProvider(GitProvider):
             if pr_patches is None:
                 raise ValueError(f"Failed to decode PR patch with encodings {encodings_to_try}")
 
-        diff_split = ["diff --git" + x for x in pr_patches.split("diff --git") if x.strip()]
+        diff_split = _split_raw_diff(pr_patches)
         # filter all elements of 'diff_split' that are of indices in 'diffs_original' that are not in 'diffs'
         if len(diff_split) > len(diffs) and len(diffs_original) == len(diff_split):
             diff_split = [diff_split[i] for i in range(len(diff_split)) if diffs_original[i] in diffs]
@@ -378,6 +384,9 @@ class BitbucketProvider(GitProvider):
         comment = self._get_cloud_comment(comment)
         return comment.data["links"]["html"]["href"]
 
+    def supports_html_comment_markers(self) -> bool:
+        return False
+
     def supports_review_comment_identity(self) -> bool:
         return True
 
@@ -469,6 +478,12 @@ class BitbucketProvider(GitProvider):
             get_logger().error(
                 f"Failed to publish inline comment to '{relevant_file}' at {location}, error: {e}")
             return False
+        recent_bodies = getattr(self, "_published_inline_comment_bodies", None)
+        if recent_bodies is None:
+            recent_bodies = []
+            self._published_inline_comment_bodies = recent_bodies
+        if body not in recent_bodies:
+            recent_bodies.append(body)
         return True
 
     def get_line_link(self, relevant_file: str, relevant_line_start: int, relevant_line_end: int = None) -> str:
@@ -572,6 +587,19 @@ class BitbucketProvider(GitProvider):
             )
 
         return comments
+
+    def get_persistent_comment_bodies(self) -> list[str]:
+        """Return existing Bitbucket Cloud comment bodies for inline deduplication."""
+        bodies = list(getattr(self, "_published_inline_comment_bodies", []))
+        for comment in self.get_issue_comments():
+            body = getattr(comment, "body", "")
+            if body and body not in bodies:
+                bodies.append(body)
+        return bodies
+
+    def get_recent_inline_comment_bodies(self) -> list[str]:
+        """Return inline comment bodies published during this provider run."""
+        return list(getattr(self, "_published_inline_comment_bodies", []))
 
     def remove_reaction(self, issue_comment_id: int, reaction_id: int) -> bool:
         return True

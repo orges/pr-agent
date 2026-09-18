@@ -15,6 +15,7 @@ from pr_agent.algo.ai_handlers.base_ai_handler import BaseAiHandler
 from pr_agent.algo.ai_handlers.litellm_ai_handler import LiteLLMAIHandler
 from pr_agent.algo.git_patch_processing import decouple_and_convert_to_hunks_with_lines_numbers
 from pr_agent.algo.pr_processing import (
+    OUTPUT_BUFFER_TOKENS_HARD_THRESHOLD,
     OUTPUT_BUFFER_TOKENS_SOFT_THRESHOLD,
     _get_all_models,
     add_ai_metadata_to_diff_files,
@@ -27,6 +28,7 @@ from pr_agent.algo.prompt_fragments import render_diff_hunk_format
 from pr_agent.algo.repo_context import build_repo_context
 from pr_agent.algo.run_details import init_run_details, record_model_used
 from pr_agent.algo.skills_loader import get_skills_context
+from pr_agent.algo.token_budget import AttemptTokenBudget
 from pr_agent.algo.token_handler import TokenHandler
 from pr_agent.algo.utils import (
     ModelType,
@@ -36,8 +38,8 @@ from pr_agent.algo.utils import (
     clip_tokens,
     comment_matches_identity,
     format_pr_code_suggestions_header,
-    get_max_tokens,
     get_model,
+    hidden_marker_forms,
     load_yaml,
     push_outputs,
     replace_code_tags,
@@ -150,7 +152,7 @@ class PRCodeSuggestions:
         self._setup_incremental_scope()
         # If incremental is active but the scope came back empty (no files changed since the
         # previous suggestions pass), short-circuit init now. `run()` checks the same flag and
-        # exits without touching the model. This avoids a wasted `mr.changes()` round-trip via
+        # exits without touching the model. This avoids a wasted full MR-diff retrieval via
         # `get_files()` — when `unreviewed_files_map` is `{}` it's falsy and `get_files()` falls
         # back to the full MR file list, which is pure waste on the "nothing new" path.
         if (self.incremental.is_incremental
@@ -400,6 +402,7 @@ class PRCodeSuggestions:
                         pr_body = add_comment_identity(
                             pr_body,
                             PRCodeSuggestionsIdentity.SUMMARY.value,
+                            self.git_provider,
                         )
                         if self.progress_response:
                             if not _edit_comment_safely(self.git_provider, self.progress_response, pr_body):
@@ -502,6 +505,7 @@ class PRCodeSuggestions:
             pr_body = add_comment_identity(
                 pr_body,
                 PRCodeSuggestionsIdentity.NO_SUGGESTIONS.value,
+                self.git_provider,
             )
             # Output the agent run details (model, tokens, time cost) if enabled, so the
             # "no suggestions" result still shows which model produced it.
@@ -672,12 +676,13 @@ class PRCodeSuggestions:
         def _without_heading(comment_text: str) -> str:
             if comment_text.startswith(initial_header):
                 comment_text = comment_text[len(initial_header):].lstrip("\n")
-            if identity_marker and comment_text.startswith(identity_marker):
-                comment_text = comment_text[len(identity_marker):].lstrip("\n")
+            for marker in hidden_marker_forms(identity_marker) if identity_marker else ():
+                if comment_text.startswith(marker):
+                    comment_text = comment_text[len(marker):].lstrip("\n")
             return comment_text.strip()
 
         def _with_identity(comment_text: str) -> str:
-            return add_comment_identity(comment_text, identity_marker)
+            return add_comment_identity(comment_text, identity_marker, git_provider)
 
         history_header = "#### Previous suggestions\n"
         last_commit_num = git_provider.get_latest_commit_url().split('/')[-1][:7]
@@ -820,11 +825,29 @@ class PRCodeSuggestions:
         return new_comment
 
     async def _prepare_prediction(self, model: str) -> dict:
+        output_token_reserve = getattr(self.ai_handler, "get_output_token_reserve", None)
+        attempt_variables = copy.deepcopy(self.vars)
+        attempt_variables["diff"] = ""
+        attempt_variables["diff_no_line_numbers"] = ""
+        self._suggestion_attempt_budget = AttemptTokenBudget.for_prompt_attempt(
+            model,
+            getattr(self.git_provider, "pr", None),
+            attempt_variables,
+            self.pr_code_suggestions_prompt_system,
+            self.pr_code_suggestions_prompt_user,
+            ai_handler=self.ai_handler,
+            output_token_reserve=output_token_reserve,
+        )
+        self._suggestion_attempt_budget.require_input_capacity(
+            OUTPUT_BUFFER_TOKENS_SOFT_THRESHOLD,
+            preserve_minimum=True,
+        )
         self.patches_diff = get_pr_diff(self.git_provider,
-                                        self.token_handler,
+                                        self._suggestion_attempt_budget.token_handler,
                                         model,
                                         add_line_numbers_to_hunks=True,
-                                        disable_extra_lines=False)
+                                        disable_extra_lines=False,
+                                        output_token_reserve=output_token_reserve)
         self.patches_diff_list = [self.patches_diff]
         self.patches_diff_no_line_number = self.remove_line_numbers([self.patches_diff])[0]
 
@@ -848,7 +871,40 @@ class PRCodeSuggestions:
         return system_prompt, user_prompt
 
     async def _get_prediction(self, model: str, patches_diff: str, patches_diff_no_line_number: str) -> dict:
-        system_prompt, user_prompt = self._render_prediction_prompts(patches_diff, patches_diff_no_line_number)
+        budget = getattr(self, "_suggestion_attempt_budget", None)
+        if budget is None or budget.model != model:
+            attempt_variables = copy.deepcopy(self.vars)
+            attempt_variables["diff"] = ""
+            attempt_variables["diff_no_line_numbers"] = ""
+            budget = AttemptTokenBudget.for_prompt_attempt(
+                model,
+                getattr(self.git_provider, "pr", None),
+                attempt_variables,
+                self.pr_code_suggestions_prompt_system,
+                self.pr_code_suggestions_prompt_user,
+                ai_handler=self.ai_handler,
+                output_token_reserve=getattr(self.ai_handler, "get_output_token_reserve", None),
+            )
+            self._suggestion_attempt_budget = budget
+
+        def render(diff_no_line_numbers: str) -> tuple[str, str]:
+            variables = copy.deepcopy(self.vars)
+            variables["diff"] = patches_diff
+            variables["diff_no_line_numbers"] = diff_no_line_numbers
+            return budget.render_prompt_templates(variables)
+
+        fitted = budget.fit_optional_text(
+            patches_diff_no_line_number,
+            render,
+            ai_handler=self.ai_handler,
+            default_output_tokens=OUTPUT_BUFFER_TOKENS_HARD_THRESHOLD,
+            preserve_minimum=True,
+        )
+        if fitted.optional_text != patches_diff_no_line_number:
+            raise ValueError(
+                f"The complete suggestion chunk does not fit the token limit for {model}"
+            )
+        system_prompt, user_prompt = fitted.system_prompt, fitted.user_prompt
         response, finish_reason = await self.ai_handler.chat_completion(
             model=model, temperature=get_settings().config.temperature, system=system_prompt, user=user_prompt)
         if not get_settings().config.publish_output:
@@ -1215,6 +1271,8 @@ class PRCodeSuggestions:
                 existing_code if new_code_snippet else None)
             if new_code_snippet and has_valid_anchor:
                 new_code_snippet = self.dedent_code(relevant_file, relevant_lines_start, new_code_snippet)
+                existing_code = self.dedent_code(relevant_file, relevant_lines_start, existing_code)
+                d = {**d, "existing_code": existing_code, "improved_code": new_code_snippet}
 
             requires_pr_fallback = False
             if d.get('_is_truncated'):
@@ -1700,17 +1758,52 @@ class PRCodeSuggestions:
                 # Resolve token controls under the same deployment that the fallback request will use.
                 settings.set("openai.deployment_id", deployment)
                 try:
-                    token_handler = TokenHandler(model=fallback_model)
-                    output_reserve = self._recovery_output_reserve(fallback_model)
-                    budget = get_max_tokens(fallback_model) - output_reserve
+                    attempt_variables = copy.deepcopy(self.vars)
+                    attempt_variables["diff"] = ""
+                    attempt_variables["diff_no_line_numbers"] = ""
+                    attempt_budget = AttemptTokenBudget.for_prompt_attempt(
+                        fallback_model,
+                        getattr(self.git_provider, "pr", None),
+                        attempt_variables,
+                        self.pr_code_suggestions_prompt_system,
+                        self.pr_code_suggestions_prompt_user,
+                        ai_handler=self.ai_handler,
+                        output_token_reserve=getattr(
+                            self.ai_handler,
+                            "get_output_token_reserve",
+                            None,
+                        ),
+                    )
                     for index in pending:
-                        system, user = self._render_prediction_prompts(*chunk_pairs[index])
-                        tokens = token_handler.count_tokens(system) + token_handler.count_tokens(user)
-                        if tokens <= budget:
-                            eligible.append(index)
+                        numbered, unnumbered = chunk_pairs[index]
+
+                        def render(candidate: str) -> tuple[str, str]:
+                            variables = copy.deepcopy(self.vars)
+                            variables["diff"] = numbered
+                            variables["diff_no_line_numbers"] = candidate
+                            return attempt_budget.render_prompt_templates(variables)
+
+                        try:
+                            fitted = attempt_budget.fit_optional_text(
+                                unnumbered,
+                                render,
+                                ai_handler=self.ai_handler,
+                                default_output_tokens=OUTPUT_BUFFER_TOKENS_HARD_THRESHOLD,
+                                preserve_minimum=True,
+                            )
+                        except ValueError:
+                            get_logger().warning(
+                                f"Skipping recovery of chunk {index + 1} with {fallback_model}: "
+                                "the required prompt exceeds its token budget"
+                            )
                         else:
-                            get_logger().warning(f"Skipping recovery of chunk {index + 1} with {fallback_model}: "
-                                                 "the complete prompt exceeds its token budget")
+                            if fitted.optional_text != unnumbered:
+                                get_logger().warning(
+                                    f"Skipping recovery of chunk {index + 1} with {fallback_model}: "
+                                    "the complete diff does not fit its token budget"
+                                )
+                                continue
+                            eligible.append(index)
                 except Exception as error:
                     get_logger().warning(f"Cannot prepare chunk recovery with {fallback_model}: {error}")
                     continue
@@ -1736,58 +1829,59 @@ class PRCodeSuggestions:
         finally:
             settings.set("openai.deployment_id", original_deployment)
 
-    def _recovery_output_reserve(self, model: str) -> int:
-        """Return the completion headroom to reserve for a recovery fallback model.
-
-        The LiteLLM handler reports the output allowance it will actually request
-        (config.max_output_tokens, extended thinking, per-provider controls); fall
-        back to the fixed soft threshold only when it exposes no specific limit so a
-        near-limit prompt is not classified as eligible without enough headroom.
-        """
-        get_output_token_reserve = getattr(self.ai_handler, "get_output_token_reserve", None)
-        if callable(get_output_token_reserve):
-            try:
-                output_tokens = get_output_token_reserve(model, OUTPUT_BUFFER_TOKENS_SOFT_THRESHOLD)
-            except Exception as error:
-                get_logger().debug(f"Failed to resolve the output token reserve for {model}: {error}")
-            else:
-                if (
-                    isinstance(output_tokens, int)
-                    and not isinstance(output_tokens, bool)
-                    and output_tokens > 0
-                ):
-                    return output_tokens
-        return OUTPUT_BUFFER_TOKENS_SOFT_THRESHOLD
-
     async def prepare_prediction_main(self, model: str) -> dict:
         self.failed_chunk_count = 0
         self.total_chunk_count = 0
         self.parse_failure_count = 0
+        output_token_reserve = getattr(self.ai_handler, "get_output_token_reserve", None)
+        attempt_variables = copy.deepcopy(self.vars)
+        attempt_variables["diff"] = ""
+        attempt_variables["diff_no_line_numbers"] = ""
+        self._suggestion_attempt_budget = AttemptTokenBudget.for_prompt_attempt(
+            model,
+            getattr(self.git_provider, "pr", None),
+            attempt_variables,
+            self.pr_code_suggestions_prompt_system,
+            self.pr_code_suggestions_prompt_user,
+            ai_handler=self.ai_handler,
+            output_token_reserve=output_token_reserve,
+        )
+        self._suggestion_attempt_budget.require_input_capacity(
+            OUTPUT_BUFFER_TOKENS_SOFT_THRESHOLD,
+            preserve_minimum=True,
+        )
+        attempt_token_handler = self._suggestion_attempt_budget.token_handler
         # get PR diff
         if get_settings().pr_code_suggestions.decouple_hunks:
             self.patches_diff_list = get_pr_multi_diffs(self.git_provider,
-                                                        self.token_handler,
+                                                        attempt_token_handler,
                                                         model,
                                                         max_calls=get_settings().pr_code_suggestions.max_number_of_calls,
-                                                        add_line_numbers=True)  # decouple hunk with line numbers
+                                                        add_line_numbers=True,
+                                                        output_token_reserve=output_token_reserve)  # decouple hunk with line numbers
             self.patches_diff_list_no_line_numbers = self.remove_line_numbers(self.patches_diff_list)  # decouple hunk
 
         else:
             # non-decoupled hunks
             self.patches_diff_list_no_line_numbers = get_pr_multi_diffs(self.git_provider,
-                                                                        self.token_handler,
+                                                                        attempt_token_handler,
                                                                         model,
                                                                         max_calls=get_settings().pr_code_suggestions.max_number_of_calls,
-                                                                        add_line_numbers=False)
+                                                                        add_line_numbers=False,
+                                                                        output_token_reserve=output_token_reserve)
             self.patches_diff_list = await self.convert_to_decoupled_with_line_numbers(
-                self.patches_diff_list_no_line_numbers, model)
+                self.patches_diff_list_no_line_numbers,
+                model,
+                attempt_budget=self._suggestion_attempt_budget,
+            )
             if not self.patches_diff_list:
                 # fallback to decoupled hunks
                 self.patches_diff_list = get_pr_multi_diffs(self.git_provider,
-                                                            self.token_handler,
+                                                            attempt_token_handler,
                                                             model,
                                                             max_calls=get_settings().pr_code_suggestions.max_number_of_calls,
-                                                            add_line_numbers=True)  # decouple hunk with line numbers
+                                                            add_line_numbers=True,
+                                                            output_token_reserve=output_token_reserve)  # decouple hunk with line numbers
                 self.patches_diff_list_no_line_numbers = self.remove_line_numbers(self.patches_diff_list)
 
         if self.patches_diff_list:
@@ -1837,12 +1931,30 @@ class PRCodeSuggestions:
             self.data = data
         else:
             get_logger().warning("Empty PR diff list")
-            self.data = data = None
+            raise ValueError(f"No PR diff fits the /improve request for {model}")
         return data
 
-    async def convert_to_decoupled_with_line_numbers(self, patches_diff_list_no_line_numbers, model) -> List[str]:
+    async def convert_to_decoupled_with_line_numbers(
+        self,
+        patches_diff_list_no_line_numbers,
+        model,
+        *,
+        attempt_budget: AttemptTokenBudget | None = None,
+    ) -> List[str]:
         with get_logger().contextualize(sub_feature='convert_to_decoupled_with_line_numbers'):
             try:
+                if attempt_budget is None:
+                    attempt_budget = AttemptTokenBudget.for_attempt(
+                        model,
+                        self.token_handler,
+                        output_token_reserve=getattr(
+                            getattr(self, "ai_handler", None), "get_output_token_reserve", None
+                        ),
+                        ignore_max_model_tokens=True,
+                    )
+                max_input_tokens = attempt_budget.available_tokens(
+                    2_000, preserve_minimum=True
+                )
                 patches_diff_list = []
                 for patch_prompt in patches_diff_list_no_line_numbers:
                     file_prefix = "## File: "
@@ -1859,14 +1971,23 @@ class PRCodeSuggestions:
                                                                                                           file=None).strip()
                         patches_new[i] = patches_new[i].strip()
                     patch_final = "\n\n\n".join(patches_new)
-                    # take the actual max tokens, without any reductions
-                    max_tokens_full = get_max_tokens(model, ignore_max_model_tokens=True)
-                    delta_output = 2000
-                    token_count = self.token_handler.count_tokens(patch_final)
-                    if token_count > max_tokens_full - delta_output:
+                    token_count = attempt_budget.count_tokens(patch_final)
+                    if token_count > max_input_tokens:
                         get_logger().warning(
-                            f"Token count {token_count} exceeds the limit {max_tokens_full - delta_output}. clipping the tokens")
-                        patch_final = clip_tokens(patch_final, max_tokens_full - delta_output)
+                            f"Token count {token_count} exceeds the limit {max_input_tokens}. clipping the tokens")
+                        add_truncation_marker = True
+                        while patch_final and token_count > max_input_tokens:
+                            clipped_patch = clip_tokens(
+                                patch_final,
+                                max_input_tokens,
+                                add_three_dots=add_truncation_marker,
+                                num_input_tokens=token_count,
+                            )
+                            add_truncation_marker = False
+                            if len(clipped_patch) >= len(patch_final):
+                                clipped_patch = patch_final[:len(patch_final) // 2]
+                            patch_final = clipped_patch
+                            token_count = attempt_budget.count_tokens(patch_final)
                     patches_diff_list.append(patch_final)
                 return patches_diff_list
             except Exception:
@@ -2046,18 +2167,40 @@ class PRCodeSuggestions:
                              include_ai_metadata=is_ai_metadata,
                          ),
                          'duplicate_prompt_examples': get_settings().config.get('duplicate_prompt_examples', False)}
-            environment = Environment(undefined=StrictUndefined)
-
             if dedicated_prompt:
-                system_prompt_reflect = environment.from_string(
-                    get_settings().get(dedicated_prompt).system).render(variables)
-                user_prompt_reflect = environment.from_string(
-                    get_settings().get(dedicated_prompt).user).render(variables)
+                system_template = get_settings().get(dedicated_prompt).system
+                user_template = get_settings().get(dedicated_prompt).user
             else:
-                system_prompt_reflect = environment.from_string(
-                    get_settings().pr_code_suggestions_reflect_prompt.system).render(variables)
-                user_prompt_reflect = environment.from_string(
-                    get_settings().pr_code_suggestions_reflect_prompt.user).render(variables)
+                system_template = get_settings().pr_code_suggestions_reflect_prompt.system
+                user_template = get_settings().pr_code_suggestions_reflect_prompt.user
+
+            raw_diff = variables["diff"]
+            variables["diff"] = ""
+            output_token_reserve = getattr(self.ai_handler, "get_output_token_reserve", None)
+            git_provider = getattr(self, "git_provider", None)
+            budget = AttemptTokenBudget.for_prompt_attempt(
+                model,
+                getattr(git_provider, "pr", None),
+                variables,
+                system_template,
+                user_template,
+                ai_handler=self.ai_handler,
+                output_token_reserve=output_token_reserve,
+            )
+            fitted = budget.fit_prompt_variable(
+                variables,
+                "diff",
+                raw_diff,
+                ai_handler=self.ai_handler,
+                default_output_tokens=OUTPUT_BUFFER_TOKENS_SOFT_THRESHOLD,
+                keep="prefix",
+            )
+            if fitted.optional_text != raw_diff:
+                raise ValueError(
+                    f"The complete reflection diff does not fit the token limit for {model}"
+                )
+            system_prompt_reflect = fitted.system_prompt
+            user_prompt_reflect = fitted.user_prompt
 
             with get_logger().contextualize(command="self_reflect_on_suggestions"):
                 response_reflect, finish_reason_reflect = await self.ai_handler.chat_completion(model=model,

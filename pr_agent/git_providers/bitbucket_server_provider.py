@@ -1,11 +1,10 @@
 import difflib
 import re
-import shlex
 import subprocess
 from collections import Counter
 from types import SimpleNamespace
 from typing import Optional, Tuple
-from urllib.parse import quote_plus, urlparse
+from urllib.parse import quote, quote_plus, urlparse
 
 from atlassian.bitbucket import Bitbucket
 from packaging.version import parse as parse_version
@@ -100,7 +99,7 @@ class BitbucketServerProvider(GitProvider):
             get_logger().error(f"workspace_name or project_name not found in context, either git url: {repo_git_url} or uninitialized workspace/project.")
             return ("", "")
         prefix = f"{self.bitbucket_server_url}/projects/{workspace_name}/repos/{project_name}/browse"
-        suffix = f"?at=refs%2Fheads%2F{desired_branch}"
+        suffix = f"?at=refs%2Fheads%2F{quote(desired_branch, safe='')}"
         return (prefix, suffix)
 
     def get_repo_settings(self):
@@ -763,10 +762,15 @@ class BitbucketServerProvider(GitProvider):
             #Shouldn't happen since this is checked in _prepare_clone, therefore - throwing an exception.
             raise RuntimeError("Bearer token is required!")
 
-        cli_args = shlex.split(f"git clone -c http.extraHeader='Authorization: Bearer {bearer_token}' "
-                               f"--filter=blob:none --depth 1 {repo_url} {dest_folder}")
-
-        ssl_env = get_git_ssl_env()
-
-        subprocess.run(cli_args, env=ssl_env, check=True,  # check=True will raise an exception if the command fails
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=operation_timeout_in_seconds)
+        # Pass the header through the Git process environment (Git >= 2.31), so it never
+        # reaches argv or the checkout's .git/config.
+        ssl_env = {
+            **get_git_ssl_env(),
+            "GIT_CONFIG_COUNT": "1",
+            "GIT_CONFIG_KEY_0": "http.extraHeader",
+            "GIT_CONFIG_VALUE_0": f"Authorization: Bearer {bearer_token}",
+        }
+        cli_args = ["git", "clone", "--filter=blob:none", "--depth", "1", repo_url, dest_folder]
+        subprocess.run(cli_args, env=ssl_env, check=True,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                       timeout=operation_timeout_in_seconds)
