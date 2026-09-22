@@ -2774,23 +2774,42 @@ class LiteLLMAIHandler(BaseAiHandler):
                         # OpenRouter's unified reasoning object below.
                         openrouter_reasoning_effort = reasoning_effort
                     else:
-                        get_logger().info(f"Adding reasoning_effort with value {reasoning_effort} to model {model}.")
-                        kwargs["reasoning_effort"] = reasoning_effort
-                        # Whitelist reasoning_effort through allowed_openai_params when
-                        # LiteLLM omits it from the params it reports for unknown or
-                        # OpenAI-compatible gateway-prefixed model IDs. Merge into any
-                        # existing allowed_openai_params instead of overwriting it.
-                        try:
-                            supported_params = litellm.get_supported_openai_params(
-                                model=model,
-                                custom_llm_provider=custom_llm_provider or None,
-                            ) or []
-                        except Exception:
-                            supported_params = []
-                        if "reasoning_effort" not in supported_params:
-                            allowed_params = kwargs.get("allowed_openai_params") or []
-                            if "reasoning_effort" not in allowed_params:
-                                kwargs["allowed_openai_params"] = [*allowed_params, "reasoning_effort"]
+                        # GLM models served through OpenAI-compatible proxies (e.g. CLIProxyAPI) accept
+                        # the OpenRouter-style "reasoning" object in the request body, and reject the
+                        # flat reasoning_effort parameter for levels the upstream does not expose
+                        # (e.g. "max" on CLIProxyAPI). Route GLM efforts through extra_body; keep the
+                        # flat parameter for other models.
+                        model_base = model
+                        while model_base.startswith(('openai/', 'azure/')):
+                            model_base = model_base.removeprefix('openai/').removeprefix('azure/')
+                        if model_base.startswith('glm'):
+                            get_logger().info(
+                                f"Routing reasoning effort '{reasoning_effort}' for {model} through extra_body.reasoning")
+                            extra_body = dict(kwargs.get('extra_body') or {})
+                            reasoning_cfg = extra_body.get('reasoning')
+                            if not isinstance(reasoning_cfg, dict):
+                                reasoning_cfg = {}
+                            reasoning_cfg['effort'] = reasoning_effort
+                            extra_body['reasoning'] = reasoning_cfg
+                            kwargs['extra_body'] = extra_body
+                        else:
+                            get_logger().info(f"Adding reasoning_effort with value {reasoning_effort} to model {model}.")
+                            kwargs["reasoning_effort"] = reasoning_effort
+                            # Whitelist reasoning_effort through allowed_openai_params when
+                            # LiteLLM omits it from the params it reports for unknown or
+                            # OpenAI-compatible gateway-prefixed model IDs. Merge into any
+                            # existing allowed_openai_params instead of overwriting it.
+                            try:
+                                supported_params = litellm.get_supported_openai_params(
+                                    model=model,
+                                    custom_llm_provider=custom_llm_provider or None,
+                                ) or []
+                            except Exception:
+                                supported_params = []
+                            if "reasoning_effort" not in supported_params:
+                                allowed_params = kwargs.get("allowed_openai_params") or []
+                                if "reasoning_effort" not in allowed_params:
+                                    kwargs["allowed_openai_params"] = [*allowed_params, "reasoning_effort"]
 
                 # https://docs.anthropic.com/en/docs/build-with-claude/extended-thinking
                 adaptive_thinking_enabled = self._claude_thinking_controls["enable_claude_adaptive_thinking"]

@@ -22,7 +22,10 @@ def create_mock_settings(reasoning_effort_value):
             'custom_reasoning_model': False,
             'max_model_tokens': 32000,
             'verbosity_level': 0,
-            'get': lambda self, key, default=None: default
+            # GLM ids ride the additional_reasoning_effort_models escape hatch so
+            # the reasoning-effort gate opens regardless of the bundled litellm
+            # cost map (mirrors the production configuration for CLIProxyAPI).
+            'get': lambda self, key, default=None: ["glm-5.3", "glm-5.3-flash"] if key == "additional_reasoning_effort_models" else default
         })(),
         'litellm': type('', (), {
             'get': lambda self, key, default=None: default
@@ -87,8 +90,7 @@ class TestLiteLLMReasoningEffort:
     - thinking_kwargs_gpt5 structure validation
     """
 
-    # ========== Group 1: Valid Configuration Tests ==========
-
+    # ========== Group 1: Valid Configuration Tests ===
     @pytest.mark.parametrize("metadata_fallback", [False, True])
     @pytest.mark.parametrize(("model", "base", "request_model", "azure_mode"), [
         ("gpt-5.6_thinking", "gpt-5.6", "openai/gpt-5.6", False),
@@ -387,7 +389,6 @@ class TestLiteLLMReasoningEffort:
         assert lookups == [lookup_model]
 
     # ========== Group 2: Invalid Configuration Tests ==========
-
     @pytest.mark.asyncio
     async def test_gpt5_invalid_reasoning_effort_with_warning(self, monkeypatch, mock_logger):
         """Test GPT-5 with invalid reasoning_effort logs warning and uses default."""
@@ -495,8 +496,7 @@ class TestLiteLLMReasoningEffort:
             # Info log
             mock_logger.info.assert_any_call("Using reasoning_effort='medium' for GPT-5 model")
 
-    # ========== Group 3: Model Detection Tests ==========
-
+    # ========== Group 3: Model Detection Tests ===
     @pytest.mark.asyncio
     async def test_gpt5_model_detection_various_versions(self, monkeypatch, mock_logger):
         """Test various GPT-5 model version strings trigger the reasoning_effort logic."""
@@ -582,8 +582,7 @@ class TestLiteLLMReasoningEffort:
             call_kwargs = mock_completion.call_args[1]
             assert call_kwargs["model"] == "openai/gpt-5"
 
-    # ========== Group 4: Model Suffix Handling Tests ==========
-
+    # ========== Group 4: Model Suffix Handling Tests ===
     @pytest.mark.asyncio
     async def test_gpt5_thinking_suffix_default_medium(self, monkeypatch, mock_logger):
         """Test _thinking suffix models default to 'medium' when config is None."""
@@ -645,8 +644,7 @@ class TestLiteLLMReasoningEffort:
             assert call_kwargs["reasoning_effort"] == "high"
             mock_logger.info.assert_any_call("Using reasoning_effort='high' for GPT-5 model")
 
-    # ========== Group 5: Logging Behavior Tests ==========
-
+    # ========== Group 5: Logging Behavior Tests ===
     @pytest.mark.asyncio
     async def test_gpt5_info_logging_configured_value(self, monkeypatch, mock_logger):
         """Test info log when using configured value."""
@@ -725,8 +723,7 @@ class TestLiteLLMReasoningEffort:
             # Warning should be logged for invalid value
             mock_logger.warning.assert_called_once()
 
-    # ========== Group 6: Structure Validation Tests ==========
-
+    # ========== Group 6: Structure Validation Tests ===
     @pytest.mark.asyncio
     async def test_thinking_kwargs_gpt5_structure(self, monkeypatch, mock_logger):
         """Test that thinking_kwargs_gpt5 has correct structure."""
@@ -777,8 +774,7 @@ class TestLiteLLMReasoningEffort:
                 or "reasoning_effort" not in call_kwargs.get("allowed_openai_params", [])
             )
 
-    # ========== Group 7: Edge Cases ==========
-
+    # ========== Group 7: Edge Cases ===
     @pytest.mark.asyncio
     async def test_empty_string_reasoning_effort(self, monkeypatch, mock_logger):
         """Test empty string reasoning_effort is treated as invalid."""
@@ -886,8 +882,7 @@ class TestLiteLLMReasoningEffort:
             call_kwargs = mock_completion.call_args[1]
             assert call_kwargs["reasoning_effort"] == "medium"
 
-    # ========== Group 8: Provider Prefix Handling ==========
-
+    # ========== Group 8: Provider Prefix Handling ===
     @pytest.mark.asyncio
     async def test_gpt5_with_openai_prefix_triggers_reasoning_effort(self, monkeypatch, mock_logger):
         """Regression: model="openai/gpt-5*" must enter the GPT-5 reasoning_effort path.
@@ -1235,6 +1230,91 @@ class TestLiteLLMReasoningEffortGemini:
                 assert call_kwargs.get("reasoning_effort") == "low", f"reasoning_effort dropped for {model}"
 
 
+class TestGLMReasoningEffort:
+    """
+    GLM models behind OpenAI-compatible proxies receive their effort through the
+    OpenRouter-style extra_body "reasoning" object instead of the flat
+    reasoning_effort parameter (CLIProxyAPI rejects flat levels above "high").
+    """
+
+    @pytest.mark.asyncio
+    async def test_glm_sends_effort_via_extra_body(self, monkeypatch, mock_logger):
+        """glm-5.3 routes effort through extra_body["reasoning"]["effort"], not the flat param."""
+        fake_settings = create_mock_settings("max")
+        monkeypatch.setattr(litellm_handler, "get_settings", lambda: fake_settings)
+
+        with patch('pr_agent.algo.ai_handlers.litellm_ai_handler.acompletion', new_callable=AsyncMock) as mock_completion:
+            mock_completion.return_value = create_mock_acompletion_response()
+
+            handler = LiteLLMAIHandler()
+            await handler.chat_completion(model="glm-5.3", system="test system", user="test user")
+
+            call_kwargs = mock_completion.call_args[1]
+            assert "reasoning_effort" not in call_kwargs
+            assert call_kwargs["extra_body"]["reasoning"]["effort"] == "max"
+
+    @pytest.mark.asyncio
+    async def test_glm_prefixed_model_uses_extra_body(self, monkeypatch, mock_logger):
+        """Provider-prefixed "openai/glm-5.3" is matched and routed through extra_body."""
+        fake_settings = create_mock_settings("high")
+        monkeypatch.setattr(litellm_handler, "get_settings", lambda: fake_settings)
+
+        with patch('pr_agent.algo.ai_handlers.litellm_ai_handler.acompletion', new_callable=AsyncMock) as mock_completion:
+            mock_completion.return_value = create_mock_acompletion_response()
+
+            handler = LiteLLMAIHandler()
+            await handler.chat_completion(model="openai/glm-5.3", system="test system", user="test user")
+
+            call_kwargs = mock_completion.call_args[1]
+            assert "reasoning_effort" not in call_kwargs
+            assert call_kwargs["extra_body"]["reasoning"]["effort"] == "high"
+
+    @pytest.mark.asyncio
+    async def test_glm_invalid_effort_falls_back_to_medium(self, monkeypatch, mock_logger):
+        """An invalid effort value falls back to medium inside extra_body for GLM."""
+        fake_settings = create_mock_settings("bogus")
+        monkeypatch.setattr(litellm_handler, "get_settings", lambda: fake_settings)
+
+        with patch('pr_agent.algo.ai_handlers.litellm_ai_handler.acompletion', new_callable=AsyncMock) as mock_completion:
+            mock_completion.return_value = create_mock_acompletion_response()
+
+            handler = LiteLLMAIHandler()
+            await handler.chat_completion(model="glm-5.3", system="test system", user="test user")
+
+            call_kwargs = mock_completion.call_args[1]
+            assert call_kwargs["extra_body"]["reasoning"]["effort"] == "medium"
+
+    @pytest.mark.asyncio
+    async def test_non_glm_model_keeps_flat_param(self, monkeypatch, mock_logger):
+        """o3 (non-GLM) keeps the flat reasoning_effort parameter."""
+        fake_settings = create_mock_settings("low")
+        monkeypatch.setattr(litellm_handler, "get_settings", lambda: fake_settings)
+
+        with patch('pr_agent.algo.ai_handlers.litellm_ai_handler.acompletion', new_callable=AsyncMock) as mock_completion:
+            mock_completion.return_value = create_mock_acompletion_response()
+
+            handler = LiteLLMAIHandler()
+            await handler.chat_completion(model="o3", system="test system", user="test user")
+
+            call_kwargs = mock_completion.call_args[1]
+            assert call_kwargs["reasoning_effort"] == "low"
+            assert not (call_kwargs.get("extra_body") or {}).get("reasoning")
+
+    @pytest.mark.asyncio
+    async def test_glm_prefix_boundary_no_overmatch(self, monkeypatch, mock_logger):
+        """A model merely ending in 'glm-5.3' without a slash boundary is not routed to the GLM path."""
+        fake_settings = create_mock_settings("low")
+        monkeypatch.setattr(litellm_handler, "get_settings", lambda: fake_settings)
+
+        with patch('pr_agent.algo.ai_handlers.litellm_ai_handler.acompletion', new_callable=AsyncMock) as mock_completion:
+            mock_completion.return_value = create_mock_acompletion_response()
+
+            handler = LiteLLMAIHandler()
+            await handler.chat_completion(model="my-glm-5.3", system="test system", user="test user")
+
+            call_kwargs = mock_completion.call_args[1]
+            assert "reasoning_effort" not in call_kwargs
+            assert not (call_kwargs.get("extra_body") or {}).get("reasoning")
 class TestLiteLLMReasoningEffortTaggedModels:
     """Reasoning support is probed on the exact model id, so a ``:tag`` a local
     provider attaches (ollama/replicate Bedrock) must not fall through to the
@@ -1572,6 +1652,21 @@ class TestLiteLLMReasoningEffortGrok:
 
         assert call_kwargs["extra_body"]["reasoning"] == {"effort": "high"}
 
+    @pytest.mark.asyncio
+    async def test_glm_flash_routes_through_extra_body(self, monkeypatch, mock_logger):
+        """glm-5.3-flash uses the same extra_body reasoning routing as glm-5.3."""
+        fake_settings = create_mock_settings("medium")
+        monkeypatch.setattr(litellm_handler, "get_settings", lambda: fake_settings)
+
+        with patch('pr_agent.algo.ai_handlers.litellm_ai_handler.acompletion', new_callable=AsyncMock) as mock_completion:
+            mock_completion.return_value = create_mock_acompletion_response()
+
+            handler = LiteLLMAIHandler()
+            await handler.chat_completion(model="openai/glm-5.3-flash", system="test system", user="test user")
+
+            call_kwargs = mock_completion.call_args[1]
+            assert "reasoning_effort" not in call_kwargs
+            assert call_kwargs["extra_body"]["reasoning"]["effort"] == "medium"
 
 class TestAdditionalReasoningEffortModels:
     """Verify config.additional_reasoning_effort_models opts custom OpenAI-compatible
