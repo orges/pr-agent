@@ -11,7 +11,7 @@ from starlette.middleware import Middleware
 from starlette_context import context
 from starlette_context.middleware import RawContextMiddleware
 
-from pr_agent.agent.command_registry import command_check_run
+from pr_agent.agent.command_registry import command_check_run, resolve_command
 from pr_agent.agent.pr_agent import PRAgent, prepare_command
 from pr_agent.agent.request_policy import RequestOutcome
 from pr_agent.algo.run_details import command_failed, init_run_details
@@ -134,6 +134,34 @@ async def get_body(request):
     return body
 
 
+def _rewrite_command_mention(comment_body: str) -> str | None:
+    """Rewrite "@<trigger> <command> ..." to "/<command> ..." for configured triggers.
+
+    Triggers come from [github_app] command_mentions (e.g. ["orges", "orges-pr"]), so a
+    comment like "@orges improve" dispatches the /improve command the same way
+    "@codex review" works for other bots. Returns None when the comment is not a
+    mention command, leaving the slash-command gate untouched. The command spelling
+    is validated against the registry so unknown words ("@orges hello") stay ignored
+    instead of dispatching an unknown-command failure.
+    """
+    if not isinstance(comment_body, str):
+        return None
+    stripped = comment_body.lstrip()
+    if not stripped.startswith("@"):
+        return None
+    tokens = stripped.split(maxsplit=1)
+    if len(tokens) < 2:
+        return None
+    triggers = normalize_setting_list(get_settings().github_app.get("command_mentions", []))
+    trigger = tokens[0][1:].lower()
+    if not trigger or not any(trigger == str(t).lstrip("@").lower() for t in triggers):
+        return None
+    command_text = tokens[1].strip()
+    if not command_text or resolve_command(command_text.split(maxsplit=1)[0]) is None:
+        return None
+    return "/" + command_text
+
+
 async def handle_comments_on_pr(body: dict[str, Any],
                                 event: str,
                                 sender: str,
@@ -144,12 +172,20 @@ async def handle_comments_on_pr(body: dict[str, Any],
     if "comment" not in body:
         return {}
     comment_body = body.get("comment", {}).get("body")
+    mention_rewritten = False
     if comment_body and isinstance(comment_body, str) and not comment_body.lstrip().startswith("/"):
-        reformatted = _reformat_quote_ask_command(comment_body) if '/ask' in comment_body else None
+        rewritten = _rewrite_command_mention(comment_body)
+        if rewritten is not None:
+            comment_body = rewritten
+            mention_rewritten = True
+            get_logger().info(f"Rewrote bot mention to command: {comment_body}")
+        reformatted = None
+        if not mention_rewritten and '/ask' in comment_body:
+            reformatted = _reformat_quote_ask_command(comment_body)
         if reformatted is not None:
             comment_body = reformatted
             get_logger().info(f"Reformatting comment_body so command is at the beginning: {comment_body}")
-        else:
+        elif not mention_rewritten:
             get_logger().info("Ignoring comment not starting with /")
             return {}
     disable_eyes = False
